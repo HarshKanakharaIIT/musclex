@@ -836,8 +836,8 @@ class QuadrantFoldingGUI(BaseGUI):
             "Saves the images as compressed tifs (might not be compatible with fit2d, but works with imagej)"
         )
 
-        self.toggleFoldImage = QCheckBox("Fold Image")
-        self.toggleFoldImage.setChecked(True)
+        self.toggleFoldImage = QCheckBox("Apply background subtraction")
+        self.toggleFoldImage.setChecked(False)
         self.toggleFoldImage.setToolTip(
             "When enabled, average the four quadrants into a single folded image.\n"
             "When disabled, the original (unfolded) image is used for background subtraction."
@@ -4189,6 +4189,9 @@ class QuadrantFoldingGUI(BaseGUI):
             return
         if "avg_fold" not in self.quadFold.imgCache:
             return
+        # Skip seeding synthetic parameters in fold-only mode
+        if not self.quadFold.info.get("fold_bg_image", True):
+            return
         computed = self.quadFold.ensureSyntheticGaussianDefaults()
         if computed is None:
             return
@@ -4334,12 +4337,34 @@ class QuadrantFoldingGUI(BaseGUI):
         if hasattr(self, "bgSubDialog"):
             self.bgSubDialog._populate_loss_params_table()
 
+    # def onFoldChkBoxToggled(self):
+    #     if self.quadFold is not None:
+    #         self.deleteImgCache(["avg_fold"])
+    #         self.deleteImgCache(["BgSubFold"])
+    #         self.processImage()
     def onFoldChkBoxToggled(self):
-        if self.quadFold is not None:
-            self.deleteImgCache(["avg_fold"])
-            self.deleteImgCache(["BgSubFold"])
-            self.processImage()
+        """Recompute the folded image whenever the fold toggle changes.
 
+        Switching fold_bg_image changes the effective average-fold source and
+        invalidates the downstream result/background caches. Clearing only
+        avg_fold/BgSubFold is insufficient because result_bg and fully rendered
+        result images can still be reused in the UI and CSV layer.
+        """
+       
+         
+
+        if self.quadFold is not None:
+            self.deleteInfo(['result_bg'])
+            self.deleteImgCache([
+                'avg_fold', 'BgSubFold', 'BgFold',
+                'BgSubFold_out', 'BgFold_out',
+                'BgSubFold_syn', 'BgFold_syn',
+                'BgSubFold_in', 'BgFold_in',
+                'BgSubFold_syn_in', 'BgFold_syn_in',
+                'BgSubFold_syn_out', 'BgFold_syn_out',
+                'resultImg', 'resultBg', 'resultFolded', 'mask',
+            ])
+            self.processImage()
     def intensityCorrectionChanged(self):
         if self.uiUpdating or self.quadFold is None:
             return
@@ -5757,15 +5782,23 @@ class QuadrantFoldingGUI(BaseGUI):
             else self.filePath
         )
         result_path = fullPath(out, "qf_results")
-        createFolder(result_path)
-
-        base, _ = splitext(str(join(result_path, qf.img_name)))
+        if not self.quadFold.info.get('fold_bg_image'):
+            print("Fold-only mode:")
+            result_dir = fullPath(result_path, 'folded')
+            suffix = '_folded'
+        else:
+            print("Fold + background mode:")
+            result_dir = fullPath(result_path, 'folded_bg')
+            suffix = '_folded_bg'
+        createFolder(result_dir)
+        base, _ = splitext(str(join(result_dir, qf.img_name)))
         img = qf.imgCache["resultImg"].astype("float32")
 
         compress = self.compressFoldedImageChkBx.isChecked()
 
         try:
-            suffix = "_folded_compressed.tif" if compress else "_folded.tif"
+            # suffix = "_folded_compressed.tif" if compress else "_folded.tif"
+            suffix = f"{suffix}_compressed.tif" if compress else f"{suffix}.tif"
             out_file = base + suffix
             # Multi-folder batches retain a relative folder in img_name to
             # avoid basename collisions.  Ensure that folder exists when the
@@ -6119,7 +6152,8 @@ class QuadrantFoldingGUI(BaseGUI):
         flags["blank_mask"] = sm.blank_enabled
         flags["apply_mask"] = sm.mask_enabled
 
-        flags["fold_image"] = self.toggleFoldImage.isChecked()
+        # flags["fold_image"] = self.toggleFoldImage.isChecked()
+        flags["fold_bg_image"] = bool(self.toggleFoldImage.isChecked())
         flags["apply_solid_angle_correction"] = bool(
             self.solidAngleCorrectionChkBx.isChecked()
         )
@@ -7093,7 +7127,7 @@ class QuadrantFoldingGUI(BaseGUI):
             "pixel_size",
             "intensity_correction_sdd_pixels",
             "center",
-            "fold_image",
+            "fold_bg_image",
             "rotate",
             "batch_processing",
             "force_recalc_bg",

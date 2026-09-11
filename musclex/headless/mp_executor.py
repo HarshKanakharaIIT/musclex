@@ -286,12 +286,21 @@ def _save_qf_result_image(quadFold, output_dir, compress_folded):
     from musclex.utils.file_manager import fullPath, createFolder
 
     result_path = fullPath(output_dir, "qf_results")
+    if not quadFold.info.get('fold_bg_image'):
+        print("Fold-only mode:")
+        result_dir = fullPath(result_path, 'folded')
+        suffix = '_folded'
+    else:
+        print("Fold + background mode:")
+        result_dir = fullPath(result_path, 'folded_bg')
+        suffix = '_folded_bg'
     createFolder(result_path)
-
+    
     base, _ = splitext(str(join(result_path, quadFold.img_name)))
     img = quadFold.imgCache["resultImg"].astype("float32")
 
-    suffix = "_folded_compressed.tif" if compress_folded else "_folded.tif"
+    # suffix = "_folded_compressed.tif" if compress_folded else "_folded.tif"
+    suffix = f"{suffix}_compressed.tif" if compress else f"{suffix}.tif"
     out_file = base + suffix
     os.makedirs(os.path.dirname(out_file), exist_ok=True)
     if compress_folded:
