@@ -666,6 +666,11 @@ class QuadrantFolder:
                     "Image has no valid signal (all pixels are zero or negative). "
                     "Please check the input file."
                 )
+            self.getRminmax()
+            self.createMask()
+            self.createArtificialData()
+            self.smoothFold()
+            self.downsampleImage()
 
         self.generateResultImage()
         self.evaluateResult()
