@@ -780,6 +780,14 @@ class QuadrantFolder:
         self._invalidate_slow_path_image_caches()
         self.transformImage()
 
+        if self.info.get('center_aligned_only'):
+            # aligned_img = np.nan_to_num(self.orig_img.copy(), nan=0.0).astype(np.float32)
+            aligned_img = self.orig_img.copy().astype(np.float32)
+            
+            self.imgCache['resultImg'] = aligned_img
+            self.imgCache['resultBg'] = np.zeros_like(aligned_img)
+            self.imgCache['resultFolded'] = aligned_img
+
         if self.info.get("fold_bg_image"):
             # Folding + Background Subtraction
             if not use_saved_folded or not self._try_load_saved_folded_base():

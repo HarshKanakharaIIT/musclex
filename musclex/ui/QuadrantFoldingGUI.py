@@ -838,11 +838,18 @@ class QuadrantFoldingGUI(BaseGUI):
 
         self.toggleFoldImage = QCheckBox("Apply background subtraction")
         self.toggleFoldImage.setChecked(False)
+        self.toggleFoldImage.setEnabled(False) # Disabled until background subtraction is implemented
         self.toggleFoldImage.setToolTip(
             "When enabled, average the four quadrants into a single folded image.\n"
             "When disabled, the original (unfolded) image is used for background subtraction."
         )
 
+                    # Center Aligned Only
+        self.centerAlignedOnlyChkBx = QCheckBox("Save Center-Aligned Only")
+        self.centerAlignedOnlyChkBx.setChecked(False)
+        self.centerAlignedOnlyChkBx.setToolTip(
+            "When enabled, save the aligned output without folding."
+        )
         self.solidAngleCorrectionChkBx = QCheckBox("Solid Angle")
         self.solidAngleCorrectionChkBx.setChecked(False)
         self.solidAngleCorrectionChkBx.setToolTip(
@@ -864,15 +871,27 @@ class QuadrantFoldingGUI(BaseGUI):
             "Select the incident-beam polarization model used by the correction"
         )
 
+        # self.settingsLayout.addWidget(
+        #     QLabel("Mask Threshold : Use Set Mask"), 0, 0, 1, 2
+        # )
+        # self.settingsLayout.addWidget(self.toggleFoldImage, 1, 0, 1, 2)
+        # self.settingsLayout.addWidget(self.compressFoldedImageChkBx, 1, 2, 1, 2)
+        # self.settingsLayout.addWidget(QLabel("Intensity Correction"), 2, 0, 1, 4)
+        # self.settingsLayout.addWidget(self.solidAngleCorrectionChkBx, 3, 0, 1, 1)
+        # self.settingsLayout.addWidget(self.polarizationCorrectionChkBx, 3, 1, 1, 1)
+        # self.settingsLayout.addWidget(self.polarizationModeCB, 3, 2, 1, 2)
+
+        # self.settingsGroup.setLayout(self.settingsLayout)
         self.settingsLayout.addWidget(
-            QLabel("Mask Threshold : Use Set Mask"), 0, 0, 1, 2
+            QLabel("Mask Threshold : Use Set Mask"), 0, 0, 1, 4
         )
         self.settingsLayout.addWidget(self.toggleFoldImage, 1, 0, 1, 2)
         self.settingsLayout.addWidget(self.compressFoldedImageChkBx, 1, 2, 1, 2)
-        self.settingsLayout.addWidget(QLabel("Intensity Correction"), 2, 0, 1, 4)
-        self.settingsLayout.addWidget(self.solidAngleCorrectionChkBx, 3, 0, 1, 1)
-        self.settingsLayout.addWidget(self.polarizationCorrectionChkBx, 3, 1, 1, 1)
-        self.settingsLayout.addWidget(self.polarizationModeCB, 3, 2, 1, 2)
+        self.settingsLayout.addWidget(self.centerAlignedOnlyChkBx, 2, 0, 1, 2)
+        self.settingsLayout.addWidget(QLabel("Intensity Correction"), 3, 0, 1, 4)
+        self.settingsLayout.addWidget(self.solidAngleCorrectionChkBx, 4, 0, 1, 1)
+        self.settingsLayout.addWidget(self.polarizationCorrectionChkBx, 4, 1, 1, 1)
+        self.settingsLayout.addWidget(self.polarizationModeCB, 4, 2, 1, 2)
 
         self.settingsGroup.setLayout(self.settingsLayout)
         # Note: settingsGroup is added in _create_quadrant_settings(), not here
@@ -1882,6 +1901,8 @@ class QuadrantFoldingGUI(BaseGUI):
         self.resultDisplayModeCB.setEnabled(False)
 
         self._addDefaultOptimizationConfig = True
+        self.toggleFoldImage.setChecked(True)  # Set default to checked
+        self.toggleFoldImage.setEnabled(True)
         self.processImage()
 
         if not checked:
@@ -2508,6 +2529,7 @@ class QuadrantFoldingGUI(BaseGUI):
             self._on_result_display_mode_changed
         )
         self.toggleFoldImage.stateChanged.connect(self.onFoldChkBoxToggled)
+        self.centerAlignedOnlyChkBx.stateChanged.connect(self.onCenterAlignedOnlyChkBoxToggled) # Center aligned only connection
         self.solidAngleCorrectionChkBx.stateChanged.connect(
             self.intensityCorrectionChanged
         )
@@ -3880,7 +3902,8 @@ class QuadrantFoldingGUI(BaseGUI):
         # self._force_no_fast_path_on_process = True
 
         self.resultDisplayModeCB.setEnabled(False)
-
+        self.toggleFoldImage.setChecked(True)  # Set default to checked
+        self.toggleFoldImage.setEnabled(True)
         self.processImage()
 
         if (
@@ -4364,6 +4387,25 @@ class QuadrantFoldingGUI(BaseGUI):
                 'BgSubFold_syn_out', 'BgFold_syn_out',
                 'resultImg', 'resultBg', 'resultFolded', 'mask',
             ])
+            self.processImage()
+
+    def onCenterAlignedOnlyChkBoxToggled(self, state):
+        checked = bool(state)
+
+        # Center-aligned-only and folded output are mutually exclusive
+        # Mutual Exclusivity: It enforces that "Center-aligned-only" and "Folded output" 
+        # cannot be active at the same time by inverting the state of toggleFoldImage.
+        self.toggleFoldImage.blockSignals(True)
+        try:
+            self.toggleFoldImage.setChecked(not checked)
+        finally:
+            self.toggleFoldImage.blockSignals(False)
+
+        if checked:
+            self.resultDisplayModeCB.setCurrentText("Subtracted")
+
+        # Re-process the current image immediately
+        if getattr(self, 'quadFold', None) is not None:
             self.processImage()
     def intensityCorrectionChanged(self):
         if self.uiUpdating or self.quadFold is None:
@@ -5782,7 +5824,19 @@ class QuadrantFoldingGUI(BaseGUI):
             else self.filePath
         )
         result_path = fullPath(out, "qf_results")
-        if not self.quadFold.info.get('fold_bg_image'):
+        # if not self.quadFold.info.get('fold_bg_image'):
+        #     print("Fold-only mode:")
+        #     result_dir = fullPath(result_path, 'folded')
+        #     suffix = '_folded'
+        # else:
+        #     print("Fold + background mode:")
+        #     result_dir = fullPath(result_path, 'folded_bg')
+        #     suffix = '_folded_bg'
+        if self.quadFold.info.get('center_aligned_only'):
+            print("Center-aligned-only mode:")
+            result_dir = fullPath(result_path, 'aligned')
+            suffix = '_aligned'
+        elif not self.quadFold.info.get('fold_bg_image'):
             print("Fold-only mode:")
             result_dir = fullPath(result_path, 'folded')
             suffix = '_folded'
@@ -6154,6 +6208,7 @@ class QuadrantFoldingGUI(BaseGUI):
 
         # flags["fold_image"] = self.toggleFoldImage.isChecked()
         flags["fold_bg_image"] = bool(self.toggleFoldImage.isChecked())
+        flags['center_aligned_only'] = bool(self.centerAlignedOnlyChkBx.isChecked())
         flags["apply_solid_angle_correction"] = bool(
             self.solidAngleCorrectionChkBx.isChecked()
         )
