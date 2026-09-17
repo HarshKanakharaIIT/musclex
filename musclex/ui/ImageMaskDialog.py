@@ -59,7 +59,7 @@ from PySide6.QtCore import Qt
 import fabio
 
 from .pyqt_utils import getAFile
-
+from musclex.ui.MaskTool import MaskTool
 
 class ImageMaskDialog(QDialog):
     def __init__(self, image_data, settings_dir_path, vmin, vmax):
@@ -569,70 +569,156 @@ class ImageMaskDialog(QDialog):
 
         return mask_config
 
+    # def drawMask(self):
+    #     if self.imageData is not None:
+    #         # Run pyFAI-drawmask in a separate thread
+    #         thread = threading.Thread(target=self._run_drawmask_command_and_refresh)
+    #         thread.start()
+    #     else:
+    #         print("No image data available for drawing mask.")
+
+    # def _run_drawmask_command_and_refresh(self):
+    #     try:
+    #         # Run the command
+    #         self._run_drawmask_command()
+    #     except Exception as e:
+    #         print("Exception occurred:", e)
+    #         tb_str = traceback.format_exc()
+    #         print(f"Full traceback: {tb_str}\n")
+
+    #     drawnMaskData = self.read_image_data(self.drawn_mask_file_path)
+
+    #     if np.array_equal(drawnMaskData, self.drawnMaskData):
+    #         return
+
+    #     if (drawnMaskData is not None) and drawnMaskData.shape == self.imageData.shape:
+    #         # pyFAI saves mask as 0=keep, 1=mask, so we invert it
+    #         # Also ensure it's uint8 (0 or 1 only)
+    #         self.drawnMaskData = (1 - drawnMaskData).astype(np.uint8)
+    #     else:
+    #         self.drawnMaskData = None
+
+    #     # Update widgets and auto-check if mask is available
+    #     self.updateDrawnMaskWidgets()
+    #     self.refreshImage()
+
+    # def _run_drawmask_command(self):
+    #     """
+    #     Run the pyFAI-drawmask command:
+    #     1) Create a temporary TIFF file for pyFAI to read (command-line tool needs a file)
+    #     2) Call pyFAI-drawmask on that TIFF
+    #     3) Move the resulting mask to the final location
+    #     4) Clean up temporary files
+    #     """
+
+    #     # Create temporary file for pyFAI-drawmask (it's a command-line tool, needs a file path)
+    #     temp_input_path = self.settings_dir_path / "temp_for_drawmask.tif"
+    #     fabio.tifimage.tifimage(data=self.imageData).write(temp_input_path)
+
+    #     # pyFAI will produce: temp_for_drawmask-mask.edf
+    #     generated_mask_path = self.settings_dir_path / "temp_for_drawmask-mask.edf"
+
+    #     # Use the cross-environment launcher: works in venv/pip installs and
+    #     # also in the PyInstaller-frozen .deb where pyFAI-drawmask is neither
+    #     # on PATH nor reachable via "python -m".
+    #     from ..utils.drawmask_launcher import run_pyfai_drawmask
+
+    #     ret_val = run_pyfai_drawmask(temp_input_path)
+
+    #     # Move the generated mask to final location
+    #     if generated_mask_path.exists():
+    #         if self.drawn_mask_file_path.exists():
+    #             self.drawn_mask_file_path.unlink()
+    #         generated_mask_path.rename(self.drawn_mask_file_path)
+
+    #     # Clean up temporary input file
+    #     temp_input_path.unlink(missing_ok=True)
     def drawMask(self):
-        if self.imageData is not None:
-            # Run pyFAI-drawmask in a separate thread
-            thread = threading.Thread(target=self._run_drawmask_command_and_refresh)
-            thread.start()
-        else:
+        """
+        Open the current MuscleX MaskTool and let the user draw the mask.
+
+        No pyFAI command or background thread is required.
+        """
+        if self.imageData is None:
             print("No image data available for drawing mask.")
-
-    def _run_drawmask_command_and_refresh(self):
-        try:
-            # Run the command
-            self._run_drawmask_command()
-        except Exception as e:
-            print("Exception occurred:", e)
-            tb_str = traceback.format_exc()
-            print(f"Full traceback: {tb_str}\n")
-
-        drawnMaskData = self.read_image_data(self.drawn_mask_file_path)
-
-        if np.array_equal(drawnMaskData, self.drawnMaskData):
             return
 
-        if (drawnMaskData is not None) and drawnMaskData.shape == self.imageData.shape:
-            # pyFAI saves mask as 0=keep, 1=mask, so we invert it
-            # Also ensure it's uint8 (0 or 1 only)
+        self.maskTool = MaskTool(
+            image=self.imageData,
+            parent=self,
+        )
+
+        self.maskTool.show()
+
+        # When the MaskTool is closed, read the saved mask.
+        self.maskTool.destroyed.connect(self._on_mask_tool_closed)
+
+
+    def _on_mask_tool_closed(self):
+        """
+        Reload the drawn mask after MaskTool is closed.
+        """
+        drawnMaskData = self.read_image_data(self.drawn_mask_file_path)
+
+        if (
+            drawnMaskData is not None
+            and drawnMaskData.shape == self.imageData.shape
+        ):
+            # MaskTool stores:
+            #   0 = unmasked
+            #   1 = masked
+            #
+            # ImageMaskDialog internally expects:
+            #   1 = unmasked
+            #   0 = masked
             self.drawnMaskData = (1 - drawnMaskData).astype(np.uint8)
         else:
             self.drawnMaskData = None
 
-        # Update widgets and auto-check if mask is available
         self.updateDrawnMaskWidgets()
         self.refreshImage()
 
+
     def _run_drawmask_command(self):
         """
-        Run the pyFAI-drawmask command:
-        1) Create a temporary TIFF file for pyFAI to read (command-line tool needs a file)
-        2) Call pyFAI-drawmask on that TIFF
-        3) Move the resulting mask to the final location
-        4) Clean up temporary files
+        Save the mask produced by the current MuscleX MaskTool.
+
+        This replaces the old pyFAI-drawmask command completely.
         """
+        if not hasattr(self, "maskTool") or self.maskTool is None:
+            return
 
-        # Create temporary file for pyFAI-drawmask (it's a command-line tool, needs a file path)
-        temp_input_path = self.settings_dir_path / "temp_for_drawmask.tif"
-        fabio.tifimage.tifimage(data=self.imageData).write(temp_input_path)
+        mask = self.maskTool.get_mask()
 
-        # pyFAI will produce: temp_for_drawmask-mask.edf
-        generated_mask_path = self.settings_dir_path / "temp_for_drawmask-mask.edf"
+        if mask is None:
+            print("No mask was created.")
+            return
 
-        # Use the cross-environment launcher: works in venv/pip installs and
-        # also in the PyInstaller-frozen .deb where pyFAI-drawmask is neither
-        # on PATH nor reachable via "python -m".
-        from ..utils.drawmask_launcher import run_pyfai_drawmask
+        mask = np.asarray(mask, dtype=np.uint8)
 
-        ret_val = run_pyfai_drawmask(temp_input_path)
+        # Ensure the mask has the same dimensions as the source image.
+        if mask.shape != self.imageData.shape:
+            print(
+                f"Mask shape {mask.shape} does not match "
+                f"image shape {self.imageData.shape}."
+            )
+            return
 
-        # Move the generated mask to final location
-        if generated_mask_path.exists():
-            if self.drawn_mask_file_path.exists():
-                self.drawn_mask_file_path.unlink()
-            generated_mask_path.rename(self.drawn_mask_file_path)
+        # Make sure destination exists.
+        self.drawn_mask_file_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
-        # Clean up temporary input file
-        temp_input_path.unlink(missing_ok=True)
+        # Keep the existing EDF format so the rest of ImageMaskDialog
+        # can continue using fabio.open().
+        fabio.edfimage.edfimage(
+            data=mask
+        ).write(self.drawn_mask_file_path)
+
+        print(
+            f"Saved drawn mask to: {self.drawn_mask_file_path}"
+        )
 
     def createDisplayImage(
         self, imageArray, minInt, maxInt, displayImageWidth, displayImageHeight

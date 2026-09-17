@@ -3902,6 +3902,7 @@ class QuadrantFoldingGUI(BaseGUI):
         # self._force_no_fast_path_on_process = True
 
         self.resultDisplayModeCB.setEnabled(False)
+        self.quadFold.info['fold_bg_image'] = True
         self.toggleFoldImage.setChecked(True)  # Set default to checked
         self.toggleFoldImage.setEnabled(True)
         self.processImage()
@@ -4389,24 +4390,11 @@ class QuadrantFoldingGUI(BaseGUI):
             ])
             self.processImage()
 
-    def onCenterAlignedOnlyChkBoxToggled(self, state):
-        checked = bool(state)
 
-        # Center-aligned-only and folded output are mutually exclusive
-        # Mutual Exclusivity: It enforces that "Center-aligned-only" and "Folded output" 
-        # cannot be active at the same time by inverting the state of toggleFoldImage.
-        self.toggleFoldImage.blockSignals(True)
-        try:
-            self.toggleFoldImage.setChecked(not checked)
-        finally:
-            self.toggleFoldImage.blockSignals(False)
-
-        if checked:
-            self.resultDisplayModeCB.setCurrentText("Subtracted")
-
-        # Re-process the current image immediately
-        if getattr(self, 'quadFold', None) is not None:
-            self.processImage()
+    def onCenterAlignedOnlyChkBoxToggled(self):
+            if self.quadFold is not None:
+                self.deleteImgCache(['align'])
+                self.processImage()
     def intensityCorrectionChanged(self):
         if self.uiUpdating or self.quadFold is None:
             return
@@ -5792,31 +5780,110 @@ class QuadrantFoldingGUI(BaseGUI):
 
         self.currentTask = None
 
+    # def saveResults(self, full_process=True, quad_fold=None):
+    #     """
+    #     Save the result image to qf_results.
+
+    #     Filename rules:
+    #       - compress unchecked  -> <name>_folded.tif
+    #       - compress checked    -> <name>_folded_compressed.tif
+
+    #     Both variants are full-size copies of resultImg and are eligible
+    #     for fast-path reload next session.
+
+    #     :param full_process: True if the slow-path ran (process() did the
+    #         full pipeline); False on the fast-path. Retained for callers and
+    #         logging -- saveBackground() now runs on both paths (it records the
+    #         cached background sum and only skips the bg.tif rewrite when the
+    #         background arrays weren't reconstructed), so the result tif and the
+    #         background_sum.csv row are both emitted regardless.
+    #     """
+    #     qf = quad_fold if quad_fold is not None else self.quadFold
+    #     if qf is None:
+    #         return
+
+    #     print("SAVE RESULTS")
+    #     if "resultImg" not in qf.imgCache:
+    #         return
+
+    #     out = (
+    #         self.workspace.dir_context.output_dir
+    #         if self.workspace.dir_context
+    #         else self.filePath
+    #     )
+    #     result_path = fullPath(out, "qf_results")
+    #     # if not self.quadFold.info.get('fold_bg_image'):
+    #     #     print("Fold-only mode:")
+    #     #     result_dir = fullPath(result_path, 'folded')
+    #     #     suffix = '_folded'
+    #     # else:
+    #     #     print("Fold + background mode:")
+    #     #     result_dir = fullPath(result_path, 'folded_bg')
+    #     #     suffix = '_folded_bg'
+    #     if self.quadFold.info.get('center_aligned_only'):
+    #         print("Center-aligned-only mode:")
+    #         result_dir = fullPath(result_path, 'aligned')
+    #         suffix = '_aligned'
+    #         img = qf.imgCache["align"].astype("float32")
+    #     elif not self.quadFold.info.get('fold_bg_image'):
+    #         print("Fold-only mode:")
+    #         result_dir = fullPath(result_path, 'folded')
+    #         suffix = '_folded'
+    #         img = qf.imgCache["resultImg"].astype("float32")
+    #     else:
+    #         print("Fold + background mode:")
+    #         result_dir = fullPath(result_path, 'folded_bg')
+    #         suffix = '_folded_bg'
+    #         img = qf.imgCache["resultImg"].astype("float32")
+
+    #     createFolder(result_dir)
+    #     base, _ = splitext(str(join(result_dir, qf.img_name)))
+        
+    #     # img is now defined dynamically in the blocks above based on the mode
+    #     # img = qf.imgCache["resultImg"].astype("float32")
+
+    #     compress = self.compressFoldedImageChkBx.isChecked()
+
+    #     try:
+    #         # suffix = "_folded_compressed.tif" if compress else "_folded.tif"
+    #         suffix = f"{suffix}_compressed.tif" if compress else f"{suffix}.tif"
+    #         out_file = base + suffix
+    #         # Multi-folder batches retain a relative folder in img_name to
+    #         # avoid basename collisions.  Ensure that folder exists when the
+    #         # image is revisited after the batch (for example via alignment).
+    #         os.makedirs(os.path.dirname(out_file), exist_ok=True)
+    #         if compress:
+    #             Image.fromarray(img).save(out_file, compression="tiff_lzw")
+    #         else:
+    #             fabio.tifimage.tifimage(data=img).write(out_file)
+    #     except Exception as e:
+    #         print("Error saving image", e)
+    #         if self.batchProcessing and hasattr(self, "saveErrors"):
+    #             import traceback
+
+    #             self.saveErrors[qf.img_name] = traceback.format_exc()
+
+    #     self.saveBackground(quad_fold=qf)
     def saveResults(self, full_process=True, quad_fold=None):
         """
         Save the result image to qf_results.
 
         Filename rules:
-          - compress unchecked  -> <name>_folded.tif
-          - compress checked    -> <name>_folded_compressed.tif
+        - compress unchecked  -> <name>_<mode>.tif
+        - compress checked    -> <name>_<mode>_compressed.tif
 
-        Both variants are full-size copies of resultImg and are eligible
+        Both variants are full-size copies of the active image and are eligible
         for fast-path reload next session.
 
         :param full_process: True if the slow-path ran (process() did the
             full pipeline); False on the fast-path. Retained for callers and
-            logging -- saveBackground() now runs on both paths (it records the
-            cached background sum and only skips the bg.tif rewrite when the
-            background arrays weren't reconstructed), so the result tif and the
-            background_sum.csv row are both emitted regardless.
+            logging -- saveBackground() now runs on both paths.
         """
         qf = quad_fold if quad_fold is not None else self.quadFold
         if qf is None:
             return
 
         print("SAVE RESULTS")
-        if "resultImg" not in qf.imgCache:
-            return
 
         out = (
             self.workspace.dir_context.output_dir
@@ -5824,39 +5891,62 @@ class QuadrantFoldingGUI(BaseGUI):
             else self.filePath
         )
         result_path = fullPath(out, "qf_results")
-        # if not self.quadFold.info.get('fold_bg_image'):
-        #     print("Fold-only mode:")
-        #     result_dir = fullPath(result_path, 'folded')
-        #     suffix = '_folded'
-        # else:
-        #     print("Fold + background mode:")
-        #     result_dir = fullPath(result_path, 'folded_bg')
-        #     suffix = '_folded_bg'
-        if self.quadFold.info.get('center_aligned_only'):
+
+        # Determine directory, suffix, and appropriate image cache source
+        # Check if BOTH modes are active
+        if self.quadFold.info.get('center_aligned_only') and self.quadFold.info.get('fold_bg_image'):
+            print("Center-Aligned + Fold + Background mode:")
+            # Verify both required cache items exist
+            if "align" not in qf.imgCache or "resultImg" not in qf.imgCache:
+                print("Error: Required cache images ('align' or 'resultImg') not found.")
+                return
+            result_dir = fullPath(result_path, 'aligned_folded_bg')
+            suffix = '_aligned_folded_bg'
+            # Define how you want to combine or use both images here
+            img = qf.imgCache["resultImg"].astype("float32") # or a combined array
+
+        # Otherwise, handle Center-Aligned only
+        elif self.quadFold.info.get('center_aligned_only'):
             print("Center-aligned-only mode:")
+            if "align" not in qf.imgCache:
+                print("Error: 'align' image not found in cache.")
+                return
             result_dir = fullPath(result_path, 'aligned')
             suffix = '_aligned'
+            img = qf.imgCache["align"].astype("float32")
+
+        # Otherwise, handle Fold-only (no background)
         elif not self.quadFold.info.get('fold_bg_image'):
             print("Fold-only mode:")
+            if "resultImg" not in qf.imgCache:
+                print("Error: 'resultImg' not found in cache.")
+                return
             result_dir = fullPath(result_path, 'folded')
             suffix = '_folded'
+            img = qf.imgCache["resultImg"].astype("float32")
+
+        # Default: Fold + background mode (neither of the above)
         else:
             print("Fold + background mode:")
+            if "resultImg" not in qf.imgCache:
+                print("Error: 'resultImg' not found in cache.")
+                return
             result_dir = fullPath(result_path, 'folded_bg')
             suffix = '_folded_bg'
+            img = qf.imgCache["resultImg"].astype("float32")
+
         createFolder(result_dir)
         base, _ = splitext(str(join(result_dir, qf.img_name)))
-        img = qf.imgCache["resultImg"].astype("float32")
 
         compress = self.compressFoldedImageChkBx.isChecked()
 
         try:
-            # suffix = "_folded_compressed.tif" if compress else "_folded.tif"
             suffix = f"{suffix}_compressed.tif" if compress else f"{suffix}.tif"
             out_file = base + suffix
+            
             # Multi-folder batches retain a relative folder in img_name to
-            # avoid basename collisions.  Ensure that folder exists when the
-            # image is revisited after the batch (for example via alignment).
+            # avoid basename collisions. Ensure that folder exists when the
+            # image is revisited after the batch.
             os.makedirs(os.path.dirname(out_file), exist_ok=True)
             if compress:
                 Image.fromarray(img).save(out_file, compression="tiff_lzw")
