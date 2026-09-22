@@ -78,7 +78,7 @@ class MaskImageViewer(ImageViewerWidget):
         super()._handle_pan_drag(event)
 
 
-class MaskTool(QMainWindow):
+class MaskTool(QWidget):
     """
     Interactive image mask editor.
 
@@ -93,10 +93,7 @@ class MaskTool(QMainWindow):
     def __init__(self, image=None, parent=None):
         super().__init__(parent)
 
-        self.setWindowTitle("MuscleX - Mask Tool")
-        self.resize(1250, 850)
-
-        # Use the existing MuscleX stylesheet from Python.
+        # Embeddable editor: parent dialog owns the window and Save action.
         if stylesheet:
             self.setStyleSheet(stylesheet)
 
@@ -129,10 +126,7 @@ class MaskTool(QMainWindow):
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        central = QWidget(self)
-        self.setCentralWidget(central)
-
-        root = QVBoxLayout(central)
+        root = QVBoxLayout(self)
         root.setContentsMargins(6, 6, 6, 6)
         root.setSpacing(6)
 
@@ -179,13 +173,14 @@ class MaskTool(QMainWindow):
         self.undoButton = QPushButton("Undo")
         self.redoButton = QPushButton("Redo")
         self.clearButton = QPushButton("Clear")
+        # Saving is handled by the containing Set Image Mask dialog.
         self.saveButton = QPushButton("Save Mask")
+        self.saveButton.setVisible(False)
         self.loadButton = QPushButton("Load Mask")
 
         controls.addWidget(self.undoButton)
         controls.addWidget(self.redoButton)
         controls.addWidget(self.clearButton)
-        controls.addWidget(self.saveButton)
         controls.addWidget(self.loadButton)
 
         root.addLayout(controls)
@@ -207,7 +202,6 @@ class MaskTool(QMainWindow):
         self.undoButton.clicked.connect(self.undo)
         self.redoButton.clicked.connect(self.redo)
         self.clearButton.clicked.connect(self.clear_mask)
-        self.saveButton.clicked.connect(self.save_mask)
         self.loadButton.clicked.connect(self.load_mask)
 
         self.brushSpinBox.valueChanged.connect(self._brush_size_changed)
@@ -254,6 +248,21 @@ class MaskTool(QMainWindow):
         if self.mask is None:
             return None
         return self.mask.copy()
+
+    def set_mask(self, mask):
+        """Load an existing boolean/0-1 mask into the editor."""
+        if self.mask is None:
+            return
+        mask = np.asarray(mask).astype(bool)
+        if mask.shape != self.mask.shape:
+            raise ValueError(
+                f"Mask shape {mask.shape} does not match image shape {self.mask.shape}."
+            )
+        self.mask = mask.copy()
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self._clear_preview()
+        self._redraw_mask_overlay()
 
     def has_mask(self):
         return self.mask is not None and bool(np.any(self.mask))

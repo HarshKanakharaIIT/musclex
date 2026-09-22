@@ -140,6 +140,18 @@ class ImageMaskDialog(QDialog):
         self.imageLayout.addWidget(self.imageLabel)
         self.imageLayout.addWidget(self.statusBar)
 
+        # Embed the drawing editor in this dialog (no second pop-up window).
+        self.maskTool = MaskTool(image=self.imageData, parent=self.imageWidget)
+        # Give the embedded editor the full image pane while drawing.
+        self.maskTool.setMinimumSize(850, 650)
+        self.maskTool.setVisible(False)
+        if self.drawnMaskData is not None:
+            # Dialog uses inverse convention: 1=keep, 0=masked.
+            self.maskTool.set_mask(1 - self.drawnMaskData)
+        self.imageLayout.addWidget(self.maskTool, 1)
+        self.imageLayout.setStretch(0, 0)
+        self.imageLayout.setStretch(2, 1)
+
         # Single unified Mask Options group
         self.applyMaskGroup = QGroupBox("Mask Options")
         self.applyMaskGroup.setToolTip(
@@ -461,6 +473,9 @@ class ImageMaskDialog(QDialog):
         self.refreshImage()
 
     def okClicked(self):
+        # Commit the editor's current drawing before generating mask.tif/config.
+        if self.maskTool.isVisible():
+            self._run_drawmask_command()
         self.saveMaskConfig()
         self.accept()
 
@@ -634,91 +649,42 @@ class ImageMaskDialog(QDialog):
     #     # Clean up temporary input file
     #     temp_input_path.unlink(missing_ok=True)
     def drawMask(self):
-        """
-        Open the current MuscleX MaskTool and let the user draw the mask.
+        """Switch the left pane from preview to the embedded mask editor.
 
-        No pyFAI command or background thread is required.
+        The editor occupies the image pane instead of being stacked below
+        the 800x600 preview, which previously pushed it out of view.
         """
         if self.imageData is None:
             print("No image data available for drawing mask.")
             return
 
-        self.maskTool = MaskTool(
-            image=self.imageData,
-            parent=self,
-        )
+        # Hide the static preview while editing so the canvas gets the
+        # available vertical space and is not clipped beneath it.
+        self.imageLabel.hide()
+        self.statusBar.hide()
+        self.maskTool.setVisible(True)
 
+        # Expand the parent dialog to accommodate the editor and its controls.
+        self.setMinimumSize(1450, 850)
+        self.resize(max(self.width(), 1450), max(self.height(), 850))
         self.maskTool.show()
 
-        # When the MaskTool is closed, read the saved mask.
-        self.maskTool.destroyed.connect(self._on_mask_tool_closed)
-
-
-    def _on_mask_tool_closed(self):
-        """
-        Reload the drawn mask after MaskTool is closed.
-        """
-        drawnMaskData = self.read_image_data(self.drawn_mask_file_path)
-
-        if (
-            drawnMaskData is not None
-            and drawnMaskData.shape == self.imageData.shape
-        ):
-            # MaskTool stores:
-            #   0 = unmasked
-            #   1 = masked
-            #
-            # ImageMaskDialog internally expects:
-            #   1 = unmasked
-            #   0 = masked
-            self.drawnMaskData = (1 - drawnMaskData).astype(np.uint8)
-        else:
-            self.drawnMaskData = None
-
+    def _run_drawmask_command(self):
+        """Persist the embedded editor mask in the existing EDF format."""
+        mask = self.maskTool.get_mask()
+        if mask is None:
+            return
+        mask = np.asarray(mask, dtype=np.uint8)
+        if mask.shape != self.imageData.shape:
+            raise ValueError(
+                f"Mask shape {mask.shape} does not match image shape {self.imageData.shape}."
+            )
+        self.drawn_mask_file_path.parent.mkdir(parents=True, exist_ok=True)
+        fabio.edfimage.edfimage(data=mask).write(self.drawn_mask_file_path)
+        # ImageMaskDialog convention is 1=keep, 0=masked.
+        self.drawnMaskData = (1 - mask).astype(np.uint8)
         self.updateDrawnMaskWidgets()
         self.refreshImage()
-
-
-    def _run_drawmask_command(self):
-        """
-        Save the mask produced by the current MuscleX MaskTool.
-
-        This replaces the old pyFAI-drawmask command completely.
-        """
-        if not hasattr(self, "maskTool") or self.maskTool is None:
-            return
-
-        mask = self.maskTool.get_mask()
-
-        if mask is None:
-            print("No mask was created.")
-            return
-
-        mask = np.asarray(mask, dtype=np.uint8)
-
-        # Ensure the mask has the same dimensions as the source image.
-        if mask.shape != self.imageData.shape:
-            print(
-                f"Mask shape {mask.shape} does not match "
-                f"image shape {self.imageData.shape}."
-            )
-            return
-
-        # Make sure destination exists.
-        self.drawn_mask_file_path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        # Keep the existing EDF format so the rest of ImageMaskDialog
-        # can continue using fabio.open().
-        fabio.edfimage.edfimage(
-            data=mask
-        ).write(self.drawn_mask_file_path)
-
-        print(
-            f"Saved drawn mask to: {self.drawn_mask_file_path}"
-        )
 
     def createDisplayImage(
         self, imageArray, minInt, maxInt, displayImageWidth, displayImageHeight
@@ -727,8 +693,7 @@ class ImageMaskDialog(QDialog):
         # Flip the image vertically (up-down) so it matches the display
         # in the main window, where the y-axis is defined bottom-to-top
         # using ax.set_ylim.
-        flippedImageArray = np.flipud(imageArray)
-
+        flippedImageArray = imageArray
         # Normalize the flipped image to the 0-255 range for display
         if np.max(flippedImageArray) == np.min(flippedImageArray):
             normFlippedImageArray = np.full(
@@ -901,7 +866,7 @@ class ImageMaskDialog(QDialog):
         # Flip the image vertically (up-down) so it matches the display
         # in the main window, where the y-axis is defined bottom-to-top
         # using ax.set_ylim.
-        flippedImageArray = np.flipud(imageArray)
+        flippedImageArray = imageArray
 
         # 2) Normalize to 0-255 for display
         if np.max(flippedImageArray) == np.min(flippedImageArray):
@@ -935,19 +900,19 @@ class ImageMaskDialog(QDialog):
 
         # Red mask (drawnMask)
         if drawnMask is not None:
-            drawnMask = np.flipud(np.asarray(drawnMask))
+            drawnMask = np.asarray(drawnMask)
             colorImageArray[drawnMask == 0] = [255, 0, 0]
         # Green mask (lowMask)
         if lowMask is not None:
-            lowMask = np.flipud(np.asarray(lowMask))
+            lowMask = np.asarray(lowMask)
             colorImageArray[lowMask == 0] = [0, 255, 0]
         # Blue mask (highMask)
         if highMask is not None:
-            highMask = np.flipud(np.asarray(highMask))
+            highMask = np.asarray(highMask)
             colorImageArray[highMask == 0] = [0, 0, 255]
         # Purple Mask (Rmin/Rmax)
         if rMask is not None:
-            rMask = np.flipud(np.asarray(rMask))
+            rMask = np.asarray(rMask)
             colorImageArray[rMask == 0] = [255, 0, 255]
 
         # 5) Convert the color image (RGB) to QImage
