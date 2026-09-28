@@ -542,178 +542,6 @@ class QuadrantFolder:
                     return False
         return False
 
-    # def process(self, flags):
-    #     """
-    #     Run all processing steps for the current image. The pipeline is:
-
-    #         updateInfo -> initParams -> findCenter -> getRotationAngle ->
-    #         (fast-path check: load _folded.tif if fingerprint matches) ->
-    #         transformImage -> calculateAvgFold -> getRminmax ->
-    #         createMask -> createArtificialData -> smoothFold -> downsampleImage ->
-    #         searchBackground -> applyBackgroundSubtraction ->
-    #         applyBackgroundSubtractionSynthetic -> [if transition: getTransitionRad ->
-    #         applyTransitionBackgroundSubtraction -> applyTransitionBackgroundSubtractionSynthetic ->
-    #         mergeImages] -> generateResultImage -> evaluateResult -> (stamp fingerprint + cache)
-
-    #     The actual result tif is written by the GUI / headless caller
-    #     (they choose between cropped / compressed variants); next
-    #     session's fast-path picks up whichever uncropped variant they
-    #     wrote (see FAST_PATH_RESULT_SUFFIXES).
-
-    #     flags keys (notable):
-    #         ignore_folds - quadrants excluded from averaging
-    #         bgsub        - background-subtraction method name (in-radius)
-    #         bgsub_out    - background-subtraction method name (out-radius);
-    #                        only consumed when bg_options == 1 (Transition)
-    #         bg_options   - 0 = single method, 1 = Transition (uses bgsub_out
-    #                        outside transition_radius and merges in/out folds)
-    #         cirmin/cirmax/radial_bin/smooth/tension/tophat/fwhm/
-    #           boxcar_x/boxcar_y/cycles/degree
-    #                      - method-specific params for the in-radius pass;
-    #                        append "_out" for the out-radius pass (e.g.
-    #                        cirmin_out, tophat_out)
-    #         transition_radius / transition_delta
-    #                      - only used when bg_options == 1
-    #         optimize / methods / steps / max_iterations / early_stop
-    #                      - automated parameter search (BG optimizer)
-    #         no_cache     - if present, skip writing the disk cache
-    #         no_fast_path - if present, force a full reprocess even when
-    #                        the cached fingerprint matches the current one
-
-    #     Returns True if a full processing pass was performed, False if
-    #     the fast-path was used. Callers use this to decide whether
-    #     downstream work that depends on slow-path-only intermediates
-    #     (saveBackground needs avg_fold + BgSubFold) is needed.
-    #     """
-    #     print(str(self.img_name) + " is being processed...")
-
-    #     self.info.pop("stopped", None)
-    #     self.updateInfo(flags)
-    #     self.initParams()
-
-    #     # Note: Blank/mask preprocessing is already applied by ImageData.get_working_image()
-    #     # No need to apply again here (would cause double subtraction of blank image)
-
-    #     # Determine center and rotation to use for this run. These are
-    #     # required even on the fast-path so the GUI's coordinate
-    #     # conversions (click handlers, ROI overlays) keep working.
-    #     self.findCenter()  # Sets self.center from ImageData
-    #     self.getRotationAngle()  # Sets self.rotation (if not already set by GUI)
-
-    #     # ==========================================
-    #     # Fast-path: if all parameters match what produced the canonical
-    #     # _folded.tif on disk, just reload that tif and skip the
-    #     # expensive pipeline entirely.
-    #     # ==========================================
-    #     if "no_fast_path" not in flags and self._tryFastLoad():
-    #         self.parent.statusPrint("")
-    #         return False
-
-    #     # ==========================================
-    #     # Slow path: full pipeline
-    #     # ==========================================
-    #     self._invalidate_slow_path_image_caches()
-    #     self.transformImage()
-    #     # self.calculateAvgFold()
-    #     # if self.imgCache["avg_fold"].max() <= 0:
-    #     #     raise ValueError(
-    #     #         "Image has no valid signal (all pixels are zero or negative). "
-    #     #         "Please check the input file."
-    #     #     )
-    #     # self.getRminmax()
-    #     # self.fitBackgroundPerImage()
-    #     # self.subtractFittedBackground()
-    #     # self.createMask()
-    #     # self.createArtificialData()
-    #     # self.smoothFold()
-    #     # self.downsampleImage()
-    #     # if self._check_stop():
-    #     #     return
-    #     # self.searchBackground()
-    #     # if self._check_stop():
-    #     #     return
-    #     # self.applyBackgroundSubtraction()
-    #     # self.applyBackgroundSubtractionSynthetic()
-
-    #     # if self.info["bg_options"] == 1:  # Transition
-    #     #     self.getTransitionRad()
-    #     #     self.applyTransitionBackgroundSubtraction()
-    #     #     self.applyTransitionBackgroundSubtractionSynthetic()
-    #     #     self.mergeImages()
-    #     if self.info.get("fold_bg_image"):
-    #         # Folding + Background Subtraction (both need the folded base)
-    #         if not self._try_load_saved_folded_base():
-    #             self.calculateAvgFold()
-                
-    #         folded_img = self.imgCache.get("avg_fold")
-    #         if folded_img is not None and folded_img.max() <= 0:
-    #             raise ValueError(
-    #                 "Image has no valid signal (all pixels are zero or negative). "
-    #                 "Please check the input file."
-    #             )
-                
-    #         self.getRminmax()
-    #         self.createMask()
-    #         self.createArtificialData()
-    #         self.smoothFold()
-    #         self.downsampleImage()
-            
-    #         if self._check_stop():
-    #             return
-                
-    #         self.searchBackground()
-            
-    #         if self._check_stop():
-    #             return
-                
-    #         self.applyBackgroundSubtraction()
-    #         self.applyBackgroundSubtractionSynthetic()
-
-    #         if self.info.get("bg_options") == 1:  # Transition
-    #             self.getTransitionRad()
-    #             self.applyTransitionBackgroundSubtraction()
-    #             self.applyTransitionBackgroundSubtractionSynthetic()
-    #             self.mergeImages()
-    #     else:
-    #         # Only Folding
-    #         print("Fold-only mode:")
-    #         if not self._try_load_saved_folded_base():
-    #             self.calculateAvgFold()
-                
-    #         folded_img = self.imgCache.get("avg_fold")
-    #         if folded_img is not None and folded_img.max() <= 0:
-    #             raise ValueError(
-    #                 "Image has no valid signal (all pixels are zero or negative). "
-    #                 "Please check the input file."
-    #             )
-    #         self.getRminmax()
-    #         self.createMask()
-    #         self.createArtificialData()
-    #         self.smoothFold()
-    #         self.downsampleImage()
-
-    #     self.generateResultImage()
-    #     self.evaluateResult()
-
-    #     # The actual tif write is left to the GUI / headless caller --
-    #     # they decide which variant (compressed / cropped) the user wants.
-    #     # As long as the caller writes one of FAST_PATH_RESULT_SUFFIXES
-    #     # the next session can avoid recomputation entirely.
-    #     if "no_cache" not in flags:
-    #         # Stamp the fingerprint into info immediately before pickling
-    #         # so the next session can decide fast-path validity from the
-    #         # cache alone. Skipped in no_cache mode so test fixtures that
-    #         # snapshot the full info dict aren't affected by this field.
-    #         self.info["processing_fingerprint"] = self.computeFingerprint()
-    #         try:
-    #             self.cacheInfo()
-    #         except (OSError, IOError) as e:
-    #             print(f"Warning: Failed to write cache for {self.img_name}: {e}")
-    #             import traceback
-
-    #             traceback.print_exc()
-    #     self.parent.statusPrint("")
-    #     return True
 
     def process(self, flags):
         """
@@ -754,7 +582,9 @@ class QuadrantFolder:
                            the cached fingerprint matches the current one
 
         Returns True if a full processing pass was performed, False if
-        the fast-path was used.
+        the fast-path was used. Callers use this to decide whether
+        downstream work that depends on slow-path-only intermediates
+        (saveBackground needs avg_fold + BgSubFold) is needed.
         """
         print(str(self.img_name) + " is being processed...")
 
@@ -762,95 +592,82 @@ class QuadrantFolder:
         self.updateInfo(flags)
         self.initParams()
 
-        self.findCenter()  
-        self.getRotationAngle()  
+        # Note: Blank/mask preprocessing is already applied by ImageData.get_working_image()
+        # No need to apply again here (would cause double subtraction of blank image)
 
-        # Track whether the fast-path check succeeded or if a full reprocess is forced
-        fingerprint_changed = True
-        if "no_fast_path" not in flags:
-            if self._tryFastLoad():
-                self.parent.statusPrint("")
-                return False
+        # Determine center and rotation to use for this run. These are
+        # required even on the fast-path so the GUI's coordinate
+        # conversions (click handlers, ROI overlays) keep working.
+        self.findCenter()  # Sets self.center from ImageData
+        self.getRotationAngle()  # Sets self.rotation (if not already set by GUI)
 
-        # If we reach here, a full reprocess is running (either fast-load failed 
-        # due to a fingerprint mismatch or no_fast_path was specified). 
-        # Mark that we should ignore old disk-saved folded bases to prevent stale multi-center loads.
-        use_saved_folded = "no_fast_path" not in flags and not fingerprint_changed
+        # ==========================================
+        # Fast-path: if all parameters match what produced the canonical
+        # _folded.tif on disk, just reload that tif and skip the
+        # expensive pipeline entirely.
+        # ==========================================
+        if "no_fast_path" not in flags and self._tryFastLoad():
+            self.parent.statusPrint("")
+            return False
 
+        # ==========================================
+        # Slow path: full pipeline
+        # ==========================================
         self._invalidate_slow_path_image_caches()
         self.transformImage()
-
         if self.info.get('center_aligned_only'):
             # aligned_img = np.nan_to_num(self.orig_img.copy(), nan=0.0).astype(np.float32)
             self.imgCache['align'] = self.orig_img.copy().astype(np.float32)
-            
-        
-        if self.info.get("fold_bg_image"):
-            # Folding + Background Subtraction
-            if not use_saved_folded or not self._try_load_saved_folded_base():
-                self.calculateAvgFold()
-                
-            folded_img = self.imgCache.get("avg_fold")
-            if folded_img is not None and folded_img.max() <= 0:
-                raise ValueError(
-                    "Image has no valid signal (all pixels are zero or negative). "
-                    "Please check the input file."
-                )
-                
-            self.getRminmax()
-            self.createMask()
-            self.createArtificialData()
-            self.smoothFold()
-            self.downsampleImage()
-            
-            if self._check_stop():
-                return
-                
-            self.searchBackground()
-            
-            if self._check_stop():
-                return
-                
-            self.applyBackgroundSubtraction()
-            self.applyBackgroundSubtractionSynthetic()
+        self.calculateAvgFold()
+        if self.imgCache["avg_fold"].max() <= 0:
+            raise ValueError(
+                "Image has no valid signal (all pixels are zero or negative). "
+                "Please check the input file."
+            )
+        self.getRminmax()
+        self.fitBackgroundPerImage()
+        self.subtractFittedBackground()
+        self.createMask()
+        self.createArtificialData()
+        self.smoothFold()
+        self.downsampleImage()
+        if self._check_stop():
+            return
+        self.searchBackground()
+        if self._check_stop():
+            return
+        self.applyBackgroundSubtraction()
+        self.applyBackgroundSubtractionSynthetic()
 
-            if self.info.get("bg_options") == 1:  # Transition
-                self.getTransitionRad()
-                self.applyTransitionBackgroundSubtraction()
-                self.applyTransitionBackgroundSubtractionSynthetic()
-                self.mergeImages()
-        else:
-            # Only Folding
-            print("Fold-only mode:")
-            if not use_saved_folded or not self._try_load_saved_folded_base():
-                self.calculateAvgFold()
-                
-            folded_img = self.imgCache.get("avg_fold")
-            if folded_img is not None and folded_img.max() <= 0:
-                raise ValueError(
-                    "Image has no valid signal (all pixels are zero or negative). "
-                    "Please check the input file."
-                )
-            self.getRminmax()
-            self.createMask()
-            self.createArtificialData()
-            self.smoothFold()
-            self.downsampleImage()
+        if self.info["bg_options"] == 1:  # Transition
+            self.getTransitionRad()
+            self.applyTransitionBackgroundSubtraction()
+            self.applyTransitionBackgroundSubtractionSynthetic()
+            self.mergeImages()
 
         self.generateResultImage()
         self.evaluateResult()
 
+        # The actual tif write is left to the GUI / headless caller --
+        # they decide which variant (compressed / cropped) the user wants.
+        # As long as the caller writes one of FAST_PATH_RESULT_SUFFIXES
+        # the next session can avoid recomputation entirely.
         if "no_cache" not in flags:
+            # Stamp the fingerprint into info immediately before pickling
+            # so the next session can decide fast-path validity from the
+            # cache alone. Skipped in no_cache mode so test fixtures that
+            # snapshot the full info dict aren't affected by this field.
             self.info["processing_fingerprint"] = self.computeFingerprint()
             try:
                 self.cacheInfo()
             except (OSError, IOError) as e:
                 print(f"Warning: Failed to write cache for {self.img_name}: {e}")
                 import traceback
+
                 traceback.print_exc()
-                
         self.parent.statusPrint("")
         return True
+
 
     def _invalidate_slow_path_image_caches(self):
         """Discard every image derived from a previous fold.

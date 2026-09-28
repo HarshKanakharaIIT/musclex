@@ -106,10 +106,21 @@ class MaskTool(QWidget):
         self.current_tool = None
         self.start_xy = None
         self.current_xy = None
+        # self.polygon_points = []
+        # self.last_pencil_xy = None
         self.polygon_points = []
         self.last_pencil_xy = None
 
+        # Polygon vertex editing
+        self.dragging_vertex = None       # index of vertex being dragged
+        self.completed_polygon = None     # most recently completed polygon
+        self.completed_polygon_base = None  # mask before that polygon was applied
+
         self.mask_artist = None
+        self.low_threshold_artist = None
+        self.high_threshold_artist = None
+        self.low_threshold_mask = None
+        self.high_threshold_mask = None
         self.preview_artist = None
 
         self.brush_size = 10
@@ -162,7 +173,7 @@ class MaskTool(QWidget):
             button.setCheckable(True)
             controls.addWidget(button)
 
-        controls.addWidget(QLabel("Brush:"))
+        controls.addWidget(QLabel("Width:"))
 
         self.brushSpinBox = QSpinBox()
         self.brushSpinBox.setRange(1, 200)
@@ -242,6 +253,26 @@ class MaskTool(QWidget):
         self.statusLabel.setText(
             f"Image: {image.shape[1]} x {image.shape[0]} pixels"
         )
+
+    def set_threshold_masks(self, low_mask=None, high_mask=None):
+        """Update live threshold overlays without changing the editable mask.
+
+        Threshold masks use the dialog convention: 1=keep, 0=masked.
+        """
+        shape = self.mask.shape if self.mask is not None else None
+        prepared = []
+        for threshold_mask in (low_mask, high_mask):
+            if threshold_mask is None:
+                prepared.append(None)
+                continue
+            arr = np.asarray(threshold_mask)
+            if shape is None or arr.shape != shape:
+                raise ValueError(
+                    f"Threshold mask shape {arr.shape} does not match image shape {shape}."
+                )
+            prepared.append(arr.astype(bool, copy=True))
+        self.low_threshold_mask, self.high_threshold_mask = prepared
+        self._redraw_mask_overlay()
 
     def get_mask(self):
         """Return the current boolean mask."""
@@ -350,6 +381,40 @@ class MaskTool(QWidget):
             float(np.clip(y, 0, h - 1)),
         )
 
+    def _find_polygon_vertex(self, event, points):
+        """Return the index of a nearby vertex, or None."""
+        if not points or event.x is None or event.y is None:
+            return None
+
+        ax = self.viewer.axes
+        click_xy = np.array([event.x, event.y], dtype=float)
+
+        # Compare in screen pixels so hit-testing works at different zooms.
+        vertices_px = ax.transData.transform(np.asarray(points, dtype=float))
+        distances = np.linalg.norm(vertices_px - click_xy, axis=1)
+
+        idx = int(np.argmin(distances))
+        return idx if distances[idx] <= 9 else None
+
+
+    def _redraw_edited_polygon(self):
+        """Rebuild the mask using the edited polygon vertices."""
+        if self.completed_polygon_base is None:
+            return
+
+        self.mask = self.completed_polygon_base.copy()
+        self.polygon_points = list(self.completed_polygon)
+
+        self._apply_polygon()
+
+        self.polygon_points = []
+        self._redraw_mask_overlay()
+
+        # Show the edited polygon's vertices again.
+        self.polygon_points = list(self.completed_polygon)
+        self._draw_polygon_preview()
+        self.polygon_points = []
+    
     def _mouse_pressed(self, event):
         if self.mask is None or self.current_tool is None:
             return
@@ -360,15 +425,46 @@ class MaskTool(QWidget):
 
         x, y = xy
 
-        # Polygon uses clicks rather than drag.
+        # # Polygon uses clicks rather than drag.
+        # if self.current_tool == "polygon":
+        #     if event.button == 3:
+        #         self._finish_polygon()
+        #         return
+
+        #     if event.button == 1:
+        #         self.polygon_points.append((x, y))
+        #         self._draw_polygon_preview()
+        #     return
+
+        # Polygon supports both vertex dragging and point placement.
         if self.current_tool == "polygon":
+
             if event.button == 3:
                 self._finish_polygon()
                 return
 
-            if event.button == 1:
-                self.polygon_points.append((x, y))
-                self._draw_polygon_preview()
+            if event.button != 1:
+                return
+
+            # 1) Drag a vertex of the polygon currently being drawn.
+            idx = self._find_polygon_vertex(event, self.polygon_points)
+            if idx is not None:
+                self.dragging_vertex = ("drawing", idx)
+                return
+
+            # 2) Drag a vertex of the most recently completed polygon.
+            if self.completed_polygon is not None:
+                idx = self._find_polygon_vertex(
+                    event, self.completed_polygon
+                )
+                if idx is not None:
+                    self._push_undo()
+                    self.dragging_vertex = ("completed", idx)
+                    return
+
+            # 3) Otherwise, add a new polygon point.
+            self.polygon_points.append((x, y))
+            self._draw_polygon_preview()
             return
 
         if event.button != 1:
@@ -402,10 +498,34 @@ class MaskTool(QWidget):
 
         x, y = xy
 
+        # if self.current_tool == "polygon":
+        #     if self.polygon_points:
+        #         self.current_xy = (x, y)
+        #         self._draw_polygon_preview()
+        #     return
+
         if self.current_tool == "polygon":
+
+            # Dragging a vertex while drawing a polygon.
+            if self.dragging_vertex is not None:
+                mode, idx = self.dragging_vertex
+                new_xy = self._clip_xy(x, y)
+
+                if mode == "drawing":
+                    self.polygon_points[idx] = new_xy
+                    self._draw_polygon_preview()
+
+                elif mode == "completed":
+                    self.completed_polygon[idx] = new_xy
+                    self._redraw_edited_polygon()
+
+                return
+
+            # Normal polygon preview while adding points.
             if self.polygon_points:
                 self.current_xy = (x, y)
                 self._draw_polygon_preview()
+
             return
 
         if self.start_xy is None:
@@ -429,6 +549,11 @@ class MaskTool(QWidget):
             self._draw_shape_preview()
 
     def _mouse_released(self, event):
+        # Finish vertex dragging on mouse release.
+        if self.current_tool == "polygon" and self.dragging_vertex is not None:
+            self.dragging_vertex = None
+            self.current_xy = None
+            return
         if self.mask is None or self.current_tool is None:
             return
 
@@ -651,7 +776,16 @@ class MaskTool(QWidget):
             self._clear_preview()
             return
 
+        # self._push_undo()
+        # self._apply_polygon()
+
+        # self.polygon_points = []
+        # self.current_xy = None
+# Save the mask before applying this polygon.
         self._push_undo()
+        self.completed_polygon_base = self.mask.copy()
+        self.completed_polygon = list(self.polygon_points)
+
         self._apply_polygon()
 
         self.polygon_points = []
@@ -689,28 +823,44 @@ class MaskTool(QWidget):
                 pass
             self.mask_artist = None
 
-        if not np.any(self.mask):
-            self.viewer.canvas.draw_idle()
-            return
+        if np.any(self.mask):
+            # Transparent for False, visible red overlay for True.
+            cmap = ListedColormap(
+                [
+                    (0.0, 0.0, 0.0, 0.0),
+                    (1.0, 0.0, 0.0, self.mask_alpha),
+                ]
+            )
+            self.mask_artist = self.viewer.axes.imshow(
+                self.mask,
+                cmap=cmap,
+                interpolation="nearest",
+                origin="upper",
+                zorder=10,
+            )
 
-        # Transparent for False, visible overlay for True.
-        cmap = ListedColormap(
-            [
-                (0.0, 0.0, 0.0, 0.0),
-                (1.0, 0.0, 0.0, self.mask_alpha),
-            ]
-        )
+        # Threshold overlays are independent of the user's editable red mask.
+        for attr in ("low_threshold_artist", "high_threshold_artist"):
+            artist = getattr(self, attr, None)
+            if artist is not None:
+                try:
+                    artist.remove()
+                except (ValueError, AttributeError):
+                    pass
+                setattr(self, attr, None)
 
-        # IMPORTANT:
-        # ImageViewerWidget uses imshow() with the normal image coordinate
-        # system (origin='upper'). We use exactly the same coordinate system.
-        self.mask_artist = self.viewer.axes.imshow(
-            self.mask,
-            cmap=cmap,
-            interpolation="nearest",
-            origin="upper",
-            zorder=10,
-        )
+        for mask, color, attr in (
+            (self.low_threshold_mask, (0.0, 1.0, 0.0, 0.38), "low_threshold_artist"),
+            (self.high_threshold_mask, (0.0, 0.35, 1.0, 0.38), "high_threshold_artist"),
+        ):
+            if mask is None:
+                continue
+            rgba = np.zeros((*mask.shape, 4), dtype=float)
+            rgba[~mask] = color
+            if np.any(~mask):
+                setattr(self, attr, self.viewer.axes.imshow(
+                    rgba, interpolation="nearest", origin="upper", zorder=8
+                ))
 
         self.viewer.canvas.draw_idle()
 

@@ -841,7 +841,7 @@ class QuadrantFoldingGUI(BaseGUI):
         self.toggleFoldImage.setEnabled(False) # Disabled until background subtraction is implemented
         self.toggleFoldImage.setToolTip(
             "When enabled, average the four quadrants into a single folded image.\n"
-            "When disabled, the original (unfolded) image is used for background subtraction."
+            "When disabled, the original (unfolded) image is used for background subtraction.\n Click results tab select subtraction parameters from  the Background Subtraction section  click apply background subtraction button to apply the background subtraction settings to the current image."
         )
 
                     # Center Aligned Only

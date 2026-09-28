@@ -145,6 +145,7 @@ class ImageMaskDialog(QDialog):
         # Give the embedded editor the full image pane while drawing.
         self.maskTool.setMinimumSize(850, 650)
         self.maskTool.setVisible(False)
+        self.maskTool.viewer.set_display_options(vmin=self.vmin, vmax=self.vmax) ##by pass quantization passs original vmin vmax values
         if self.drawnMaskData is not None:
             # Dialog uses inverse convention: 1=keep, 0=masked.
             self.maskTool.set_mask(1 - self.drawnMaskData)
@@ -745,7 +746,15 @@ class ImageMaskDialog(QDialog):
         image_data = fabio.open(file_path).data
         return image_data
 
+    def _sync_threshold_masks_to_tool(self):
+        """Keep the embedded MaskTool threshold overlays in sync with options."""
+        if not hasattr(self, "maskTool") or self.maskTool is None:
+            return
+        _, low_mask, high_mask = self.getMasks(self.imageData)
+        self.maskTool.set_threshold_masks(low_mask, high_mask)
+
     def refreshImage(self):
+        self._sync_threshold_masks_to_tool()
         # Image is always shown
         isApplyDrawnMask = (
             self.applyDrawnMaskCheckBox.isEnabled()
