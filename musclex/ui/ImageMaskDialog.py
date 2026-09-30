@@ -39,6 +39,7 @@ import shutil
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
+    QFileDialog,
     QLabel,
     QPushButton,
     QGroupBox,
@@ -84,16 +85,30 @@ class ImageMaskDialog(QDialog):
 
         # Mask files will be saved in settings directory
         self.drawn_mask_file_path = self.settings_dir_path / "drawn-mask.edf"
+        # PNG copy kept in sync with MaskTool's native raster-mask format.
+        self.drawn_mask_png_file_path = self.settings_dir_path / "drawn-mask.png"
+        # Editable MaskTool geometry is persisted separately from the raster EDF.
+        # The geometry sidecar keeps vertices/shape IDs/eraser state so the user
+        # can reload a mask and continue editing it.
+        self.mask_geometry_file_path = self.settings_dir_path / "drawn-mask.json"
         self.mask_config_file_path = self.settings_dir_path / "mask_config.json"
 
-        drawnMaskData = self.read_image_data(self.drawn_mask_file_path)
+        # Prefer the PNG copy when available because it is the native raster
+        # format used by MaskTool. Fall back to the legacy EDF mask for
+        # backward compatibility. Both represent the same mask convention:
+        # 1 = masked, 0 = keep in the editor; ImageMaskDialog stores the
+        # inverse in self.drawnMaskData (1 = keep, 0 = masked).
+        drawnMaskEditorData = self.read_png_mask(self.drawn_mask_png_file_path)
 
-        if (drawnMaskData is not None) and drawnMaskData.shape == self.imageData.shape:
-            # pyFAI saves mask as 0=keep, 1=mask, so we invert it
-            # Also ensure it's uint8 (0 or 1 only)
-            self.drawnMaskData = (1 - drawnMaskData).astype(np.uint8)
+        if (drawnMaskEditorData is not None) and drawnMaskEditorData.shape == self.imageData.shape:
+            self.drawnMaskData = (1 - drawnMaskEditorData).astype(np.uint8)
         else:
-            self.drawnMaskData = None
+            drawnMaskData = self.read_image_data(self.drawn_mask_file_path)
+            if (drawnMaskData is not None) and drawnMaskData.shape == self.imageData.shape:
+                # pyFAI/EDF mask is 0=keep, 1=mask; invert to dialog convention.
+                self.drawnMaskData = (1 - drawnMaskData).astype(np.uint8)
+            else:
+                self.drawnMaskData = None
 
         # If mask config file exists, load mask config.
         mask_config = self.readMaskConfig()
@@ -149,6 +164,23 @@ class ImageMaskDialog(QDialog):
         if self.drawnMaskData is not None:
             # Dialog uses inverse convention: 1=keep, 0=masked.
             self.maskTool.set_mask(1 - self.drawnMaskData)
+
+        # Restore editable geometry, if this mask was previously saved by the
+        # embedded MaskTool. The raster EDF remains the source of truth for the
+        # current mask pixels, while this JSON restores the editable shapes.
+        if self.mask_geometry_file_path.exists():
+            try:
+                loaded_geometry = self.maskTool._load_editable_geometry(
+                    self.drawn_mask_file_path
+                )
+                if loaded_geometry:
+                    print(
+                        f"Loaded editable mask geometry: "
+                        f"{self.mask_geometry_file_path}"
+                    )
+            except Exception as exc:
+                print(f"Warning: could not load editable mask geometry: {exc}")
+
         self.imageLayout.addWidget(self.maskTool, 1)
         self.imageLayout.setStretch(0, 0)
         self.imageLayout.setStretch(2, 1)
@@ -503,16 +535,31 @@ class ImageMaskDialog(QDialog):
             mask_output_path = self.settings_dir_path / "mask.tif"
             mask_output_path.unlink(missing_ok=True)
             self.drawn_mask_file_path.unlink(missing_ok=True)
-            print("🗑️  Removed mask configuration, mask.tif, and drawn mask file")
+            self.drawn_mask_png_file_path.unlink(missing_ok=True)
+            self.mask_geometry_file_path.unlink(missing_ok=True)
+            print(
+                "🗑️  Removed mask configuration, mask.tif, drawn mask file, "
+                "and editable mask geometry"
+            )
             return
 
         # Handle drawn mask: delete file if user unchecked it
-        if not isApplyDrawnMask and self.drawn_mask_file_path.exists():
+        if not isApplyDrawnMask:
             self.drawn_mask_file_path.unlink(missing_ok=True)
-            print(f"🗑️  Deleted drawn mask file: {self.drawn_mask_file_path}")
+            self.drawn_mask_png_file_path.unlink(missing_ok=True)
+            self.mask_geometry_file_path.unlink(missing_ok=True)
+            print(f"🗑️  Deleted drawn mask files: {self.drawn_mask_file_path} and {self.drawn_mask_png_file_path}")
 
         # Save mask config to file.
-        mask_config = {}
+        # This file stores the mask options and references the persistent drawn
+        # mask/geometry files. The actual vertices remain in drawn-mask.json so
+        # mask_config.json stays small and backward-compatible.
+        mask_config = {
+            "version": 2,
+            "drawn_mask_file": self.drawn_mask_file_path.name,
+            "drawn_mask_png_file": self.drawn_mask_png_file_path.name,
+            "editable_geometry_file": self.mask_geometry_file_path.name,
+        }
 
         # mask config example:
         # {
@@ -521,8 +568,8 @@ class ImageMaskDialog(QDialog):
         #     "mask_high_thresh": 1.0,
         #     "mask_high_kernel_size": 1.0,
         # }
-        # Note: drawn_mask_file_path is NOT saved in config.
-        # Drawn mask presence is determined solely by file existence.
+        # Drawn-mask/geometry filenames are stored above so the complete mask
+        # state can be identified from mask_config.json.
 
         if isApplyLowMask:
             mask_low_thresh = self.maskLowThresh.value()
@@ -550,6 +597,23 @@ class ImageMaskDialog(QDialog):
 
         with open(self.mask_config_file_path, "w") as file_stream:
             json.dump(mask_config, file_stream, indent=4)
+
+        # Save the editable MaskTool geometry alongside the raster mask.
+        # This preserves the latest vertices and persistent eraser state for
+        # future reload/edit operations.
+        if isApplyDrawnMask and self.maskTool is not None:
+            try:
+                self.maskTool._save_editable_geometry(
+                    self.drawn_mask_png_file_path
+                )
+                print(
+                    f"✅ Saved editable mask geometry to: "
+                    f"{self.mask_geometry_file_path}"
+                )
+            except Exception as exc:
+                print(f"Warning: could not save editable mask geometry: {exc}")
+        elif not isApplyDrawnMask:
+            self.mask_geometry_file_path.unlink(missing_ok=True)
 
         # Generate and save the final combined mask.tif file
         imageData = self.imageData.copy()
@@ -681,9 +745,42 @@ class ImageMaskDialog(QDialog):
                 f"Mask shape {mask.shape} does not match image shape {self.imageData.shape}."
             )
         self.drawn_mask_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Keep the existing EDF output unchanged.
         fabio.edfimage.edfimage(data=mask).write(self.drawn_mask_file_path)
+
+        # Ask the user where to save the PNG.
+        png_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Mask",
+            str(self.drawn_mask_png_file_path),
+            "PNG Images (*.png);;All Files (*)",
+        )
+
+        # If user cancels, keep the existing default PNG path.
+        if not png_path:
+            png_path = str(self.drawn_mask_png_file_path)
+
+        if not png_path.lower().endswith(".png"):
+            png_path += ".png"
+
+        # Save the same MaskTool mask as PNG.
+        try:
+            from imageio.v2 import imwrite
+            imwrite(png_path, (mask * 255).astype(np.uint8))
+        except ImportError:
+            from PIL import Image
+            Image.fromarray(
+                (mask * 255).astype(np.uint8),
+                mode="L"
+            ).save(png_path)
+
+        # Keep editable geometry synchronized with the chosen PNG.
+        self.maskTool._save_editable_geometry(png_path)
+
         # ImageMaskDialog convention is 1=keep, 0=masked.
         self.drawnMaskData = (1 - mask).astype(np.uint8)
+
         self.updateDrawnMaskWidgets()
         self.refreshImage()
 
@@ -738,6 +835,27 @@ class ImageMaskDialog(QDialog):
         )
 
         return scaledPixmap
+
+    def read_png_mask(self, file_path):
+        """Read a MaskTool PNG mask using the editor convention (1=masked)."""
+        if not file_path.exists():
+            return None
+        try:
+            try:
+                from imageio.v2 import imread
+                image_data = imread(file_path)
+            except ImportError:
+                from PIL import Image
+                image_data = np.asarray(Image.open(file_path))
+
+            image_data = np.asarray(image_data)
+            if image_data.ndim == 2:
+                return (image_data > 0).astype(np.uint8)
+            if image_data.ndim == 3:
+                return np.any(image_data[..., :3] > 0, axis=2).astype(np.uint8)
+        except Exception as exc:
+            print(f"Warning: could not read PNG mask {file_path}: {exc}")
+        return None
 
     def read_image_data(self, file_path):
         if not file_path.exists():

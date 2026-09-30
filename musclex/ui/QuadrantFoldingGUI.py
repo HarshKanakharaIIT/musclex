@@ -800,7 +800,7 @@ class QuadrantFoldingGUI(BaseGUI):
         # Add built-in settings widgets from workspace (workspace no longer adds these automatically)
         self.right_panel.add_widget(self.workspace._center_widget)
         self.right_panel.add_widget(self.workspace._rotation_widget)
-        self.right_panel.add_widget(self.workspace._blank_mask_widget)
+        self.right_panel.add_widget(self.workspace._blank_mask_widget) ########## here blank_mask -> imagemaskdialog
 
         # Add quadrant-specific settings groups
         self._create_processing_settings()

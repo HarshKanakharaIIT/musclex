@@ -29,9 +29,18 @@ mask[y, x] -> image pixel
 from __future__ import annotations
 
 import os
+import base64
+import json
+import zlib
 from pathlib import Path
 
 import numpy as np
+
+try:
+    import cv2
+except ImportError:  # pragma: no cover - only needed for interactive mask transforms
+    cv2 = None
+
 from matplotlib.colors import ListedColormap
 from matplotlib.path import Path as MplPath
 from PySide6.QtCore import Qt
@@ -115,6 +124,21 @@ class MaskTool(QWidget):
         self.dragging_vertex = None       # index of vertex being dragged
         self.completed_polygon = None     # most recently completed polygon
         self.completed_polygon_base = None  # mask before that polygon was applied
+
+        # Editable geometric masks.  Each completed rectangle/oval/polygon is
+        # kept as an object so a later double-click can select and transform it
+        # instead of treating the whole mask as an undifferentiated raster.
+        self.editable_shapes = []
+        self.next_shape_id = 0
+        self.selected_shape_index = None
+        self.edit_mode = False
+        self.edit_drag_mode = None       # "vertex" or "translate"
+        self.edit_vertex_index = None
+        self.edit_start_xy = None
+        self.edit_original_shape = None
+        self.edit_original_mask = None
+        self.edit_base_mask = None
+        self.edit_preview_artist = None
 
         self.mask_artist = None
         self.low_threshold_artist = None
@@ -247,6 +271,11 @@ class MaskTool(QWidget):
         self.undo_stack.clear()
         self.redo_stack.clear()
         self.polygon_points = []
+        self.editable_shapes = []
+        self.selected_shape_index = None
+        self.edit_mode = False
+        self.edit_drag_mode = None
+        self.edit_vertex_index = None
 
         self._redraw_mask_overlay()
 
@@ -415,8 +444,385 @@ class MaskTool(QWidget):
         self._draw_polygon_preview()
         self.polygon_points = []
     
+    # ------------------------------------------------------------------
+    # Editable completed masks
+    # ------------------------------------------------------------------
+
+    def _require_cv2(self):
+        if cv2 is None:
+            raise RuntimeError(
+                "Interactive mask translation requires OpenCV (cv2). "
+                "Install opencv-python in the MuscleX environment."
+            )
+
+    def _shape_mask(self, shape):
+        """Rasterize one editable geometric shape from its vertices."""
+        if self.mask is None:
+            return None
+
+        h, w = self.mask.shape
+        result = np.zeros((h, w), dtype=bool)
+        kind = shape.get("type")
+        vertices = np.asarray(shape.get("vertices", []), dtype=float)
+
+        if len(vertices) < 3:
+            return result
+
+        if kind == "polygon":
+            pts = np.round(vertices).astype(np.int32)
+            tmp = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillPoly(tmp, [pts], 1)
+            return tmp.astype(bool)
+
+        if kind in ("rectangle", "oval") and len(vertices) >= 4:
+            xs = vertices[:, 0]
+            ys = vertices[:, 1]
+            x1, x2 = float(xs.min()), float(xs.max())
+            y1, y2 = float(ys.min()), float(ys.max())
+
+            xmin = max(0, int(np.floor(x1)))
+            xmax = min(w - 1, int(np.ceil(x2)))
+            ymin = max(0, int(np.floor(y1)))
+            ymax = min(h - 1, int(np.ceil(y2)))
+            if xmin > xmax or ymin > ymax:
+                return result
+
+            if kind == "rectangle":
+                result[ymin:ymax + 1, xmin:xmax + 1] = True
+                return result
+
+            # Oval: use the exact bounding box represented by the four
+            # vertices.  This avoids the old behavior where vertex edits
+            # could produce an inconsistent ellipse.
+            yy, xx = np.ogrid[ymin:ymax + 1, xmin:xmax + 1]
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            rx = max((x2 - x1) / 2.0, 0.5)
+            ry = max((y2 - y1) / 2.0, 0.5)
+            result[ymin:ymax + 1, xmin:xmax + 1] = (
+                ((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2 <= 1.0
+            )
+            return result
+
+        return result
+
+    def _add_editable_shape(self, shape):
+        """Register one completed mask as an independent editable object."""
+        shape = {
+            "id": self.next_shape_id,
+            "type": shape.get("type"),
+            "vertices": [tuple(p) for p in shape.get("vertices", [])],
+            # Pixels erased from this particular mask are kept separately
+            # from the geometry so rebuilding/moving another mask cannot
+            # accidentally restore them.
+            "erased_mask": np.zeros_like(self.mask, dtype=bool),
+        }
+        self.next_shape_id += 1
+        self.editable_shapes.append(shape)
+        self.selected_shape_index = len(self.editable_shapes) - 1
+        self._draw_selected_shape()
+
+    def _shape_vertices(self, shape):
+        """Return the editable vertices stored by the shape."""
+        return [tuple(p) for p in shape.get("vertices", [])]
+
+    def _set_shape_vertices(self, shape, points):
+        """Set vertices, preserving rectangle/oval as a true 4-corner box."""
+        points = [tuple(self._clip_xy(float(x), float(y))) for x, y in points]
+
+        if shape.get("type") in ("rectangle", "oval") and len(points) >= 4:
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            xmin, xmax = min(xs), max(xs)
+            ymin, ymax = min(ys), max(ys)
+            shape["vertices"] = [
+                (xmin, ymin),
+                (xmax, ymin),
+                (xmax, ymax),
+                (xmin, ymax),
+            ]
+        else:
+            shape["vertices"] = points
+
+    def _update_shape_vertex(self, shape, vertex_index, xy):
+        """Move one vertex; rectangles/ovals keep an axis-aligned box."""
+        points = self._shape_vertices(shape)
+        if not (0 <= vertex_index < len(points)):
+            return
+
+        if shape.get("type") in ("rectangle", "oval") and len(points) == 4:
+            # Opposite corner stays fixed. Reconstruct all four corners so
+            # rectangle/oval geometry remains valid after every drag.
+            opposite = points[(vertex_index + 2) % 4]
+            moved = self._clip_xy(*xy)
+            x1, y1 = moved
+            x2, y2 = opposite
+            self._set_shape_vertices(shape, [
+                (min(x1, x2), min(y1, y2)),
+                (max(x1, x2), min(y1, y2)),
+                (max(x1, x2), max(y1, y2)),
+                (min(x1, x2), max(y1, y2)),
+            ])
+        else:
+            points[vertex_index] = self._clip_xy(*xy)
+            self._set_shape_vertices(shape, points)
+
+    def _clear_edit_overlay(self):
+        """Remove the yellow selected-shape line/vertex overlay."""
+        if self.edit_preview_artist is not None:
+            try:
+                self.edit_preview_artist.remove()
+            except (ValueError, AttributeError):
+                pass
+            self.edit_preview_artist = None
+
+    def _shape_visible_mask(self, shape):
+        """Return a shape's raster mask after its persistent erasures."""
+        shape_mask = self._shape_mask(shape)
+        if shape_mask is None:
+            return None
+
+        erased = shape.get("erased_mask")
+        if erased is not None and erased.shape == shape_mask.shape:
+            shape_mask = shape_mask & ~erased
+        return shape_mask
+
+    def _shape_hit(self, x, y, tolerance=10.0):
+        """Return (index, mode, vertex_index) for the top-most shape hit."""
+        if not self.editable_shapes:
+            return None
+
+        ax = self.viewer.axes
+        click_px = ax.transData.transform((x, y))
+
+        for index in range(len(self.editable_shapes) - 1, -1, -1):
+            shape = self.editable_shapes[index]
+            points = self._shape_vertices(shape)
+
+            # Vertex hit testing is done in screen pixels, not data units, so
+            # the handles remain equally easy to select at different zooms.
+            if points:
+                vertices_px = ax.transData.transform(np.asarray(points, dtype=float))
+                distances = np.linalg.norm(vertices_px - click_px, axis=1)
+                vertex_index = int(np.argmin(distances))
+                if distances[vertex_index] <= tolerance:
+                    return index, "vertex", vertex_index
+
+            shape_mask = self._shape_visible_mask(shape)
+            iy, ix = int(round(y)), int(round(x))
+            if (
+                shape_mask is not None
+                and 0 <= iy < shape_mask.shape[0]
+                and 0 <= ix < shape_mask.shape[1]
+                and shape_mask[iy, ix]
+            ):
+                return index, "translate", None
+
+        return None
+
+    def _draw_selected_shape(self):
+        """Draw handles for the selected geometric mask."""
+        self._clear_edit_overlay()
+
+        if (
+            not self.edit_mode
+            or self.selected_shape_index is None
+            or not (0 <= self.selected_shape_index < len(self.editable_shapes))
+        ):
+            self.viewer.canvas.draw_idle()
+            return
+
+        shape = self.editable_shapes[self.selected_shape_index]
+        points = self._shape_vertices(shape)
+        if not points:
+            self.viewer.canvas.draw_idle()
+            return
+
+        ax = self.viewer.axes
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+
+        if shape["type"] == "polygon":
+            xs = xs + [xs[0]]
+            ys = ys + [ys[0]]
+
+        (line,) = ax.plot(
+            xs, ys,
+            linewidth=1.5,
+            color="yellow",
+            marker="o",
+            markersize=6,
+            markerfacecolor="yellow",
+            markeredgecolor="black",
+            zorder=30,
+        )
+        self.edit_preview_artist = line
+        self.viewer.canvas.draw_idle()
+
+    def _rebuild_mask_from_shapes(self):
+        """Rebuild geometric masks without losing persistent eraser edits."""
+        if self.mask is None:
+            return
+
+        # Start from the non-geometric/raster contribution captured when the
+        # current edit began.  Then rebuild every geometric mask using its
+        # own persistent erased_mask.  This is the key point: an erasure is
+        # not stored only in self.mask, so editing another shape cannot
+        # recreate the erased pixels.
+        if self.edit_base_mask is not None:
+            self.mask = self.edit_base_mask.copy()
+        elif self.edit_original_mask is not None:
+            self.mask = self.edit_original_mask.copy()
+
+        # The base mask can contain the old geometric contribution. Remove
+        # all current geometric shapes before rebuilding them from their
+        # definitions.  This also prevents a moved shape from being painted
+        # twice.
+        for shape in self.editable_shapes:
+            shape_mask = self._shape_mask(shape)
+            if shape_mask is not None:
+                self.mask[shape_mask] = False
+
+        for shape in self.editable_shapes:
+            shape_mask = self._shape_visible_mask(shape)
+            if shape_mask is not None:
+                self.mask |= shape_mask
+
+        self._redraw_mask_overlay()
+        self._draw_selected_shape()
+
+    def _translate_selected_shape(self, dx, dy):
+        """Translate the selected shape by updating its geometric vertices."""
+        if self.selected_shape_index is None:
+            return
+
+        shape = self.editable_shapes[self.selected_shape_index]
+
+        points = [
+            self._clip_xy(float(x + dx), float(y + dy))
+            for x, y in shape.get("vertices", [])
+        ]
+        self._set_shape_vertices(shape, points)
+
+        # Erased pixels belong to the mask being moved, so move that mask's
+        # erasure history along with the geometry.  This keeps holes attached
+        # to their original mask while leaving erasures on other masks alone.
+        erased = shape.get("erased_mask")
+        if erased is not None and np.any(erased):
+            self._require_cv2()
+            matrix = np.float32([[1, 0, dx], [0, 1, dy]])
+            shifted = cv2.warpAffine(
+                erased.astype(np.uint8),
+                matrix,
+                (erased.shape[1], erased.shape[0]),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            shape["erased_mask"] = shifted.astype(bool)
+
+        self._rebuild_mask_from_shapes()
+
+    def _enter_edit_mode(self, index):
+        self._clear_preview()
+        self.edit_mode = True
+        self.selected_shape_index = index
+        self.edit_drag_mode = None
+        self.edit_vertex_index = None
+        shape = self.editable_shapes[index]
+        self.edit_original_shape = {
+            "id": shape.get("id"),
+            "type": shape["type"],
+            "vertices": [tuple(p) for p in shape.get("vertices", [])],
+            "erased_mask": (
+                shape.get("erased_mask").copy()
+                if shape.get("erased_mask") is not None
+                else np.zeros_like(self.mask, dtype=bool)
+            ),
+        }
+        self.edit_original_mask = self.mask.copy()
+        selected_mask = self._shape_visible_mask(self.editable_shapes[index])
+        if selected_mask is not None:
+            self.edit_base_mask = self.mask.copy()
+            self.edit_base_mask[selected_mask] = False
+        else:
+            self.edit_base_mask = self.mask.copy()
+
+        # The edit itself is undoable as one operation.
+        self._push_undo()
+
+        self.viewer.mask_drawing_enabled = True
+        self.statusLabel.setText(
+            "Mask selected: drag vertices to reshape, drag inside to move, "
+            "right-click to save the edit."
+        )
+        self._draw_selected_shape()
+
+    def _commit_edit(self):
+        if not self.edit_mode:
+            return
+
+        self.edit_original_shape = None
+        self.edit_original_mask = None
+        self.edit_base_mask = None
+        self.edit_drag_mode = None
+        self.edit_vertex_index = None
+        self.edit_start_xy = None
+        self.edit_mode = False
+
+        # Saving an edit also ends the mask-selection state.  This prevents
+        # the edited vertices/handles from remaining visible and prevents the
+        # next click from continuing to edit the same mask.
+        self.selected_shape_index = None
+        self.viewer.mask_drawing_enabled = False
+
+        # Deselect the drawing tool button as well.
+        self.current_tool = None
+        self.start_xy = None
+        self.current_xy = None
+        self.polygon_points = []
+        self.last_pencil_xy = None
+        for button in self.tool_buttons:
+            button.setChecked(False)
+
+        self._clear_edit_overlay()
+        self._clear_preview()
+        self.viewer.canvas.draw_idle()
+        self.statusLabel.setText("Mask edit saved. Mask tool deselected.")
+
+    def _cancel_edit(self):
+        if not self.edit_mode:
+            return
+
+        if self.edit_original_mask is not None:
+            self.mask = self.edit_original_mask.copy()
+        if self.edit_original_shape is not None:
+            original_id = self.edit_original_shape.get("id")
+            restored_shape = {
+                "type": self.edit_original_shape["type"],
+                "vertices": [
+                    tuple(p) for p in self.edit_original_shape["vertices"]
+                ],
+                "erased_mask": self.edit_original_shape.get("erased_mask", np.zeros_like(self.mask, dtype=bool)).copy(),
+            }
+            if original_id is not None:
+                restored_shape["id"] = original_id
+            self.editable_shapes[self.selected_shape_index] = restored_shape
+
+        self.edit_original_shape = None
+        self.edit_original_mask = None
+        self.edit_base_mask = None
+        self.edit_drag_mode = None
+        self.edit_vertex_index = None
+        self.edit_start_xy = None
+        self.edit_mode = False
+        self.viewer.mask_drawing_enabled = False
+        self._clear_edit_overlay()
+        self._redraw_mask_overlay()
+        self.statusLabel.setText("Mask edit cancelled.")
+
     def _mouse_pressed(self, event):
-        if self.mask is None or self.current_tool is None:
+        if self.mask is None:
             return
 
         xy = self._event_xy(event)
@@ -424,6 +830,52 @@ class MaskTool(QWidget):
             return
 
         x, y = xy
+
+        # Right-click commits the current edit.  If no edit is active,
+        # preserve the existing polygon right-click-to-finish behavior.
+        if event.button == 3:
+            if self.edit_mode:
+                self._commit_edit()
+            elif self.current_tool == "polygon":
+                self._finish_polygon()
+            return
+
+        # Double-click selects an existing completed geometric mask.
+        # It works without first choosing a drawing tool.
+        if getattr(event, "dblclick", False) and event.button == 1:
+            hit = self._shape_hit(x, y)
+            if hit is not None:
+                index, mode, vertex_index = hit
+                self._enter_edit_mode(index)
+                if mode == "vertex":
+                    self.edit_drag_mode = "vertex"
+                    self.edit_vertex_index = vertex_index
+                    self.edit_start_xy = (x, y)
+                else:
+                    self.edit_drag_mode = "translate"
+                    self.edit_start_xy = (x, y)
+                return
+
+        # Once a mask is selected, a normal left-drag edits it.
+        if self.edit_mode:
+            if event.button != 1:
+                return
+
+            shape = self.editable_shapes[self.selected_shape_index]
+            points = self._shape_vertices(shape)
+
+            vertex_index = self._find_polygon_vertex(event, points)
+            if vertex_index is not None:
+                self.edit_drag_mode = "vertex"
+                self.edit_vertex_index = vertex_index
+                self.edit_start_xy = (x, y)
+            elif self._shape_hit(x, y) is not None:
+                self.edit_drag_mode = "translate"
+                self.edit_start_xy = (x, y)
+            return
+
+        if self.current_tool is None:
+            return
 
         # # Polygon uses clicks rather than drag.
         # if self.current_tool == "polygon":
@@ -489,7 +941,35 @@ class MaskTool(QWidget):
             )
 
     def _mouse_moved(self, event):
-        if self.mask is None or self.current_tool is None:
+        if self.mask is None:
+            return
+
+        xy = self._event_xy(event)
+        if xy is None:
+            return
+
+        x, y = xy
+
+        if self.edit_mode and self.edit_drag_mode is not None:
+            shape = self.editable_shapes[self.selected_shape_index]
+            if self.edit_start_xy is None:
+                self.edit_start_xy = (x, y)
+
+            if self.edit_drag_mode == "vertex":
+                self._update_shape_vertex(
+                    shape, self.edit_vertex_index, (x, y)
+                )
+                self._rebuild_mask_from_shapes()
+
+            elif self.edit_drag_mode == "translate":
+                dx = x - self.edit_start_xy[0]
+                dy = y - self.edit_start_xy[1]
+                self._translate_selected_shape(dx, dy)
+                self.edit_start_xy = (x, y)
+
+            return
+
+        if self.current_tool is None:
             return
 
         xy = self._event_xy(event)
@@ -549,6 +1029,14 @@ class MaskTool(QWidget):
             self._draw_shape_preview()
 
     def _mouse_released(self, event):
+        if self.edit_mode:
+            if event.button == 1:
+                self.edit_drag_mode = None
+                self.edit_vertex_index = None
+                self.edit_start_xy = None
+                self._draw_selected_shape()
+            return
+
         # Finish vertex dragging on mouse release.
         if self.current_tool == "polygon" and self.dragging_vertex is not None:
             self.dragging_vertex = None
@@ -570,9 +1058,27 @@ class MaskTool(QWidget):
 
         if self.current_tool == "rectangle":
             self._apply_rectangle(self.start_xy, self.current_xy)
+            x1, y1 = self.start_xy
+            x2, y2 = self.current_xy
+            self._add_editable_shape({
+                "type": "rectangle",
+                "vertices": [
+                    (x1, y1), (x2, y1),
+                    (x2, y2), (x1, y2),
+                ],
+            })
 
         elif self.current_tool == "oval":
             self._apply_oval(self.start_xy, self.current_xy)
+            x1, y1 = self.start_xy
+            x2, y2 = self.current_xy
+            self._add_editable_shape({
+                "type": "oval",
+                "vertices": [
+                    (x1, y1), (x2, y1),
+                    (x2, y2), (x1, y2),
+                ],
+            })
 
         # Pencil/eraser are modified continuously during movement.
 
@@ -587,11 +1093,38 @@ class MaskTool(QWidget):
     # Raster drawing
     # ------------------------------------------------------------------
 
+    def _copy_editable_shapes(self):
+        """Deep-copy editable geometric mask definitions."""
+        return [
+            {
+                "id": shape.get("id"),
+                "type": shape["type"],
+                "vertices": [tuple(p) for p in shape.get("vertices", [])],
+                "erased_mask": (
+                    shape.get("erased_mask").copy()
+                    if shape.get("erased_mask") is not None
+                    else np.zeros_like(self.mask, dtype=bool)
+                ),
+            }
+            for shape in self.editable_shapes
+        ]
+
+    def _sync_next_shape_id(self):
+        """Keep the next mask ID higher than every currently stored ID."""
+        ids = [
+            shape.get("id")
+            for shape in self.editable_shapes
+            if isinstance(shape.get("id"), int)
+        ]
+        self.next_shape_id = max(ids, default=-1) + 1
+
     def _push_undo(self):
         if self.mask is None:
             return
 
-        self.undo_stack.append(self.mask.copy())
+        self.undo_stack.append(
+            (self.mask.copy(), self._copy_editable_shapes())
+        )
 
         # Avoid an unbounded memory footprint.
         if len(self.undo_stack) > 30:
@@ -688,6 +1221,22 @@ class MaskTool(QWidget):
             disk = (xx - x) ** 2 + (yy - y) ** 2 <= radius ** 2
 
             if erase:
+                # Keep the erasure attached to every geometric mask touched
+                # by the brush.  self.mask alone is not enough because a
+                # later shape edit rebuilds self.mask from editable_shapes.
+                for shape in self.editable_shapes:
+                    shape_mask = self._shape_mask(shape)
+                    if shape_mask is None:
+                        continue
+                    local_shape = shape_mask[ymin : ymax + 1, xmin : xmax + 1]
+                    if not np.any(local_shape & disk):
+                        continue
+                    erased_mask = shape.get("erased_mask")
+                    if erased_mask is None or erased_mask.shape != self.mask.shape:
+                        erased_mask = np.zeros_like(self.mask, dtype=bool)
+                        shape["erased_mask"] = erased_mask
+                    erased_mask[ymin : ymax + 1, xmin : xmax + 1][disk & local_shape] = True
+
                 self.mask[ymin : ymax + 1, xmin : xmax + 1][disk] = False
             else:
                 self.mask[ymin : ymax + 1, xmin : xmax + 1][disk] = True
@@ -788,6 +1337,11 @@ class MaskTool(QWidget):
 
         self._apply_polygon()
 
+        self._add_editable_shape({
+            "type": "polygon",
+            "vertices": [tuple(p) for p in self.polygon_points],
+        })
+
         self.polygon_points = []
         self.current_xy = None
 
@@ -872,8 +1426,23 @@ class MaskTool(QWidget):
         if self.mask is None or not self.undo_stack:
             return
 
-        self.redo_stack.append(self.mask.copy())
-        self.mask = self.undo_stack.pop()
+        self.redo_stack.append(
+            (self.mask.copy(), self._copy_editable_shapes())
+        )
+        state = self.undo_stack.pop()
+        if isinstance(state, tuple):
+            self.mask, self.editable_shapes = state
+            self._sync_next_shape_id()
+        else:
+            # Backward compatibility with any legacy in-memory undo entries.
+            self.mask = state
+            self.editable_shapes = []
+
+        self.selected_shape_index = None
+        self.edit_mode = False
+        self.edit_original_shape = None
+        self.edit_original_mask = None
+        self.edit_base_mask = None
 
         self._clear_preview()
         self._redraw_mask_overlay()
@@ -882,24 +1451,99 @@ class MaskTool(QWidget):
         if self.mask is None or not self.redo_stack:
             return
 
-        self.undo_stack.append(self.mask.copy())
-        self.mask = self.redo_stack.pop()
+        self.undo_stack.append(
+            (self.mask.copy(), self._copy_editable_shapes())
+        )
+        state = self.redo_stack.pop()
+        if isinstance(state, tuple):
+            self.mask, self.editable_shapes = state
+            self._sync_next_shape_id()
+        else:
+            self.mask = state
+            self.editable_shapes = []
+
+        self.selected_shape_index = None
+        self.edit_mode = False
+        self.edit_original_shape = None
+        self.edit_original_mask = None
+        self.edit_base_mask = None
 
         self._clear_preview()
         self._redraw_mask_overlay()
 
     def clear_mask(self):
+        """Clear the selected editable mask, or all masks if none is selected."""
         if self.mask is None:
             return
 
+        # If a completed geometric mask is selected, Clear means delete that
+        # shape and its mask contribution -- not every mask in the image.
+        if (
+            self.selected_shape_index is not None
+            and 0 <= self.selected_shape_index < len(self.editable_shapes)
+        ):
+            index = self.selected_shape_index
+            self._push_undo()
+
+            # During edit mode edit_base_mask is the image with the selected
+            # shape removed. Rebuild from that base so overlapping shapes are
+            # preserved correctly.
+            if self.edit_mode and self.edit_base_mask is not None:
+                new_mask = self.edit_base_mask.copy()
+            else:
+                selected_mask = self._shape_visible_mask(self.editable_shapes[index])
+                new_mask = self.mask.copy()
+                if selected_mask is not None:
+                    new_mask[selected_mask] = False
+
+                # Preserve the raster contribution of all remaining editable
+                # shapes, including overlaps with the deleted shape.
+                for other_index, shape in enumerate(self.editable_shapes):
+                    if other_index == index:
+                        continue
+                    other_mask = self._shape_visible_mask(shape)
+                    if other_mask is not None:
+                        new_mask |= other_mask
+
+            self.mask = new_mask
+            self.editable_shapes.pop(index)
+            self.selected_shape_index = None
+            self.edit_mode = False
+            self.edit_drag_mode = None
+            self.edit_vertex_index = None
+            self.edit_start_xy = None
+            self.edit_original_shape = None
+            self.edit_original_mask = None
+            self.edit_base_mask = None
+            self.viewer.mask_drawing_enabled = self.current_tool is not None
+
+            self._clear_preview()
+            self._clear_edit_overlay()
+            self._redraw_mask_overlay()
+            self.statusLabel.setText("Selected mask cleared. Other masks were kept.")
+            return
+
+        # No shape is selected: retain the original Clear All behavior.
         if not np.any(self.mask):
             return
 
         self._push_undo()
         self.mask[:] = False
+        self.editable_shapes = []
+        self.next_shape_id = 0
+        self.selected_shape_index = None
+        self.edit_mode = False
+        self.edit_drag_mode = None
+        self.edit_vertex_index = None
+        self.edit_start_xy = None
+        self.edit_original_shape = None
+        self.edit_original_mask = None
+        self.edit_base_mask = None
 
         self._clear_preview()
+        self._clear_edit_overlay()
         self._redraw_mask_overlay()
+        self.statusLabel.setText("All masks cleared.")
 
     def _brush_size_changed(self, value):
         self.brush_size = int(value)
@@ -908,7 +1552,130 @@ class MaskTool(QWidget):
     # Save / load
     # ------------------------------------------------------------------
 
+    def _mask_state_path(self, mask_path):
+        """Return the sidecar JSON path used to persist editable geometry."""
+        return os.path.splitext(mask_path)[0] + ".json"
+
+    @staticmethod
+    def _encode_bool_mask(mask):
+        """Encode a boolean mask compactly for the JSON geometry sidecar."""
+        packed = np.packbits(np.asarray(mask, dtype=np.uint8).ravel())
+        return base64.b64encode(zlib.compress(packed.tobytes(), level=6)).decode("ascii")
+
+    @staticmethod
+    def _decode_bool_mask(encoded, shape):
+        """Decode a boolean mask stored by _encode_bool_mask()."""
+        raw = zlib.decompress(base64.b64decode(encoded.encode("ascii")))
+        packed = np.frombuffer(raw, dtype=np.uint8)
+        values = np.unpackbits(packed)[: int(np.prod(shape))]
+        return values.reshape(tuple(shape)).astype(bool)
+
+    def _serialize_editable_shapes(self):
+        """Serialize the current editable geometry, including persistent erasures."""
+        shapes = []
+        mask_shape = list(self.mask.shape) if self.mask is not None else None
+
+        for shape in self.editable_shapes:
+            item = {
+                "id": shape.get("id"),
+                "type": shape.get("type"),
+                "vertices": [
+                    [float(point[0]), float(point[1])]
+                    for point in shape.get("vertices", [])
+                ],
+            }
+
+            erased = shape.get("erased_mask")
+            if erased is not None and mask_shape is not None:
+                if erased.shape != self.mask.shape:
+                    raise ValueError(
+                        f"Invalid erased mask shape {erased.shape}; "
+                        f"expected {self.mask.shape}."
+                    )
+                if np.any(erased):
+                    item["erased_mask"] = self._encode_bool_mask(erased)
+                else:
+                    item["erased_mask"] = None
+            else:
+                item["erased_mask"] = None
+
+            shapes.append(item)
+
+        return shapes
+
+    def _save_editable_geometry(self, mask_path):
+        """Save editable shape geometry next to the raster mask."""
+        state_path = self._mask_state_path(mask_path)
+        state = {
+            "version": 1,
+            "mask_file": os.path.basename(mask_path),
+            "image_shape": list(self.mask.shape),
+            "next_shape_id": int(self.next_shape_id),
+            "shapes": self._serialize_editable_shapes(),
+        }
+
+        with open(state_path, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, indent=2)
+
+        return state_path
+
+    def _load_editable_geometry(self, mask_path):
+        """Restore editable shape geometry from the PNG's JSON sidecar.
+
+        Returns True when geometry was restored, False when no sidecar exists.
+        """
+        state_path = self._mask_state_path(mask_path)
+        if not os.path.exists(state_path):
+            return False
+
+        with open(state_path, "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+
+        if state.get("version") != 1:
+            raise ValueError(
+                f"Unsupported mask geometry version: {state.get('version')}"
+            )
+
+        saved_shape = tuple(state.get("image_shape", ()))
+        if saved_shape != tuple(self.mask.shape):
+            raise ValueError(
+                f"Saved geometry shape {saved_shape} does not match "
+                f"image shape {self.mask.shape}."
+            )
+
+        restored = []
+        for raw_shape in state.get("shapes", []):
+            shape = {
+                "id": raw_shape.get("id"),
+                "type": raw_shape["type"],
+                "vertices": [
+                    (float(point[0]), float(point[1]))
+                    for point in raw_shape.get("vertices", [])
+                ],
+            }
+
+            encoded_erased = raw_shape.get("erased_mask")
+            if encoded_erased:
+                shape["erased_mask"] = self._decode_bool_mask(
+                    encoded_erased, self.mask.shape
+                )
+            else:
+                shape["erased_mask"] = np.zeros_like(self.mask, dtype=bool)
+
+            restored.append(shape)
+
+        self.editable_shapes = restored
+        self._sync_next_shape_id()
+
+        # Preserve a larger next ID if it was explicitly saved.
+        saved_next_id = state.get("next_shape_id")
+        if isinstance(saved_next_id, int):
+            self.next_shape_id = max(self.next_shape_id, saved_next_id)
+
+        return True
+
     def save_mask(self):
+        """Save the raster mask as PNG and editable geometry as a JSON sidecar."""
         if self.mask is None:
             QMessageBox.warning(self, "Mask Tool", "No image is loaded.")
             return
@@ -916,22 +1683,33 @@ class MaskTool(QWidget):
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Mask",
-            "",
-            "NumPy Mask (*.npy);;NumPy Archive (*.npz)",
+            "filename_mask.png",
+            "PNG Mask (*.png)",
         )
 
         if not path:
             return
 
-        try:
-            if path.lower().endswith(".npz"):
-                np.savez_compressed(path, mask=self.mask.astype(np.uint8))
-            else:
-                if not path.lower().endswith(".npy"):
-                    path += ".npy"
-                np.save(path, self.mask.astype(np.uint8))
+        if not path.lower().endswith(".png"):
+            path += ".png"
 
-            self.statusLabel.setText(f"Mask saved: {path}")
+        try:
+            # Boolean mask -> 8-bit grayscale PNG:
+            # False = 0 (black), True = 255 (white).
+            mask_image = self.mask.astype(np.uint8) * 255
+
+            try:
+                from imageio.v2 import imwrite
+                imwrite(path, mask_image)
+            except ImportError:
+                from PIL import Image
+                Image.fromarray(mask_image, mode="L").save(path)
+
+            state_path = self._save_editable_geometry(path)
+
+            self.statusLabel.setText(
+                f"Mask saved: {path} (editable geometry: {os.path.basename(state_path)})"
+            )
 
         except Exception as exc:
             QMessageBox.critical(
@@ -941,6 +1719,7 @@ class MaskTool(QWidget):
             )
 
     def load_mask(self):
+        """Load a PNG mask and restore editable geometry when its JSON sidecar exists."""
         if self.mask is None:
             QMessageBox.warning(self, "Mask Tool", "No image is loaded.")
             return
@@ -949,22 +1728,34 @@ class MaskTool(QWidget):
             self,
             "Load Mask",
             "",
-            "NumPy Mask (*.npy *.npz)",
+            "PNG Mask (*.png)",
         )
 
         if not path:
             return
 
         try:
-            if path.lower().endswith(".npz"):
-                data = np.load(path)
-                if "mask" not in data:
-                    raise ValueError("NPZ file does not contain a 'mask' array.")
-                loaded = data["mask"]
-            else:
-                loaded = np.load(path)
+            try:
+                from imageio.v2 import imread
+                loaded = imread(path)
+            except ImportError:
+                from PIL import Image
+                loaded = np.asarray(Image.open(path))
 
-            loaded = np.asarray(loaded).astype(bool)
+            loaded = np.asarray(loaded)
+
+            # Support grayscale and RGB/RGBA PNG files. Any non-zero pixel
+            # becomes part of the boolean mask.
+            if loaded.ndim == 2:
+                loaded = loaded > 0
+            elif loaded.ndim == 3:
+                loaded = np.any(loaded[..., :3] > 0, axis=2)
+            else:
+                raise ValueError(
+                    f"Unsupported PNG dimensions: {loaded.shape}"
+                )
+
+            loaded = loaded.astype(bool)
 
             if loaded.shape != self.mask.shape:
                 raise ValueError(
@@ -975,10 +1766,34 @@ class MaskTool(QWidget):
             self._push_undo()
             self.mask = loaded.copy()
 
+            # Start clean, then restore geometry if this PNG was created by
+            # MaskTool's Save Mask action. A plain/legacy PNG remains usable
+            # as a raster-only mask.
+            self.editable_shapes = []
+            self.next_shape_id = 0
+            self.selected_shape_index = None
+            self.edit_mode = False
+            self.edit_drag_mode = None
+            self.edit_vertex_index = None
+            self.edit_start_xy = None
+            self.edit_original_shape = None
+            self.edit_original_mask = None
+            self.edit_base_mask = None
+
+            geometry_restored = self._load_editable_geometry(path)
+
             self._clear_preview()
+            self._clear_edit_overlay()
             self._redraw_mask_overlay()
 
-            self.statusLabel.setText(f"Mask loaded: {path}")
+            if geometry_restored:
+                self.statusLabel.setText(
+                    f"Mask loaded: {path} — editable masks restored."
+                )
+            else:
+                self.statusLabel.setText(
+                    f"Mask loaded: {path} — raster mask only (no geometry sidecar found)."
+                )
 
         except Exception as exc:
             QMessageBox.critical(
