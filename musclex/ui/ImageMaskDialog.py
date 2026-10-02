@@ -160,7 +160,7 @@ class ImageMaskDialog(QDialog):
         # Give the embedded editor the full image pane while drawing.
         self.maskTool.setMinimumSize(850, 650)
         self.maskTool.setVisible(False)
-        self.maskTool.viewer.set_display_options(vmin=self.vmin, vmax=self.vmax) ##by pass quantization passs original vmin vmax values
+        self.maskTool.viewer.set_display_options(vmin=self.vmin, vmax=self.vmax) ##bypass quantization passs original vmin vmax values
         if self.drawnMaskData is not None:
             # Dialog uses inverse convention: 1=keep, 0=masked.
             self.maskTool.set_mask(1 - self.drawnMaskData)

@@ -177,7 +177,7 @@ class MaskTool(QWidget):
         controls = QHBoxLayout()
         controls.setSpacing(5)
 
-        controls.addWidget(QLabel("Mask:"))
+        controls.addWidget(QLabel("Tool:"))
 
         self.rectangleButton = QPushButton("Rectangle")
         self.ovalButton = QPushButton("Oval")
